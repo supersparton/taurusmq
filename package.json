@@ -1,0 +1,19 @@
+{
+  "name": "taurusmq",
+  "version": "1.0.0",
+  "description": "**A Distributed Background Job Engine built with Node.js and Redis.**",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "ioredis": "^5.10.1",
+    "nodemon": "^3.1.14",
+    "uuid": "^13.0.0",
+    "zod": "^4.3.6"
+  }
+}
