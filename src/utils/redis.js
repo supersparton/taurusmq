@@ -28,4 +28,16 @@ redis.defineCommand('dequeue', {
         fs.readFileSync(path.join(__dirname, '../lua/dequeue.lua'), 'utf-8')
 });
 
+redis.defineCommand('promote', {
+    numberOfKeys: 3,
+    lua:
+        fs.readFileSync(path.join(__dirname, '../lua/promote.lua'), 'utf-8')
+});
+
+redis.defineCommand('signal', {
+    numberOfKeys: 2,
+    lua:
+        fs.readFileSync(path.join(__dirname, '../lua/signal.lua'), 'utf-8')
+});
+
 module.exports = redis;

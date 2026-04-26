@@ -1,43 +1,62 @@
 const redis = require("../utils/redis");
+const Job = require("./job");
+const cron =require('cron-parser');
 
 class Worker {
     constructor(queuename, handler) {
         this.queuename = queuename;
         this.rediskey = `taurusmq:${queuename}`;
+        this.rediskeysignal = `taurusmq:signal:${queuename}`;
+        this.rediskeydelayed = `taurusmq:delayed:${queuename}`;
         this.handler = handler;
         this.active = true;
+        this.client = new Redis(process.env.REDIS_URL, {
+            maxRetriesPerRequest: null,
+        });
     }
     async start() {
         console.log(`Woker started for queue ${this.queuename}`);
         while (this.active) {
+            let job = null;
             try {
+                await this.client.blpop(this.rediskeysignal, 60);
                 const jobjson = await redis.dequeue(
-                    2,
                     this.rediskey,
                     `taurusmq:active:${this.queuename}`,
                     Date.now()
                 );
                 if (jobjson) {
-                    const job = JSON.parse(jobjson);
+                    job = JSON.parse(jobjson);
                     await this.handler(job);
                     await redis.hdel(`taurusmq:active:${this.queuename}`, job.id);
-                }
-                else {
-                    await new Promise(resolve => {
-                        setTimeout(resolve, 1000);
-                    });
+                    if(job.repeat){
+                        try{
+                            const interval = cron.CronExpressionParser.parse(job.repeat,{
+                                currentDate : new Date(job.timestamp)
+                            });
+                            const executetime = interval.next().getTime();
+                            const newjob = new Job(job.name,job.data);
+                            newjob.repeat = job.repeat;
+                            newjob.timestamp = executetime;
+                            await redis.signal(this.rediskeydelayed,this.rediskeysignal, executetime, newjob.toJson());
+                            console.log(`Scheduled next run for ${new Date(executetime).toLocaleTimeString()} in taurusmq:${this.queuename} of Job ${job.id}`);
+                        }
+                        catch(err){
+                            console.error("Cron rescheduling failed :", err.message, `for taurusmq:${this.queuename} of Job ${job.id}`);
+                        }
+                    }
                 }
             }
             catch (err) {
                 console.log(`job ${job.id} failed : `, err.message);
                 job.attempts++;
-                if (job.attempts < job.maxretries) {
+                if (job.attempts <= job.maxretries) {
                     console.log(`retrying job ${job.id} (attempt ${job.attempts}/${job.maxretries})`);
                     await redis.rpush(this.rediskey, JSON.stringify(job));
                 }
                 else {
                     console.log(`Job ${job.id} hit max limiting , moving to dlq`);
-                    await redis.rpush(`taurusmq:dlq${this.queuename}`, JSON.stringify(job));
+                    await redis.rpush(`taurusmq:dlq:${this.queuename}`, JSON.stringify(job));
                 }
                 await redis.hdel(`taurusmq:active:${this.queuename}`, job.id);
             }

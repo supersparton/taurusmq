@@ -9,6 +9,7 @@ class Job {
         this.status = 'waiting';
         this.attempts = 0;
         this.maxretries = 3;
+        this.repeat = null;
     }
     toJson() {
         return JSON.stringify({
@@ -18,7 +19,8 @@ class Job {
             timestamp: this.timestamp,
             status: this.status,
             attempts: this.attempts,
-            maxretries: this.maxretries
+            maxretries: this.maxretries,
+            repeat : this.repeat 
         });
     }
 }
