@@ -1,22 +1,31 @@
 const redis = require("../utils/redis");
+const Redis = require('ioredis');
 const Job = require("./job");
 const cron =require('cron-parser');
 
 class Worker {
-    constructor(queuename, handler) {
+    constructor(queuename, handler , options = {}) {
         this.queuename = queuename;
         this.rediskey = `taurusmq:${queuename}`;
         this.rediskeysignal = `taurusmq:signal:${queuename}`;
         this.rediskeydelayed = `taurusmq:delayed:${queuename}`;
+        
         this.handler = handler;
+        this.concurrency = options.concurrency || 1;
+        this.running =0;
         this.active = true;
         this.client = new Redis(process.env.REDIS_URL, {
             maxRetriesPerRequest: null,
         });
     }
     async start() {
-        console.log(`Woker started for queue ${this.queuename}`);
-        while (this.active) {
+        console.log(`Woker started for queue ${this.queuename} with concurrency ${this.concurrency}`);
+        for(let i=0;i<this.concurrency;i++){
+            this.work(i+1);
+        }
+    }
+    async work(id){
+        while(this.active){
             let job = null;
             try {
                 await this.client.blpop(this.rediskeysignal, 60);
@@ -26,9 +35,11 @@ class Worker {
                     Date.now()
                 );
                 if (jobjson) {
+                    this.running++;
                     job = JSON.parse(jobjson);
                     await this.handler(job);
                     await redis.hdel(`taurusmq:active:${this.queuename}`, job.id);
+                    this.running--;
                     if(job.repeat){
                         try{
                             const interval = cron.CronExpressionParser.parse(job.repeat,{
@@ -59,6 +70,7 @@ class Worker {
                     await redis.rpush(`taurusmq:dlq:${this.queuename}`, JSON.stringify(job));
                 }
                 await redis.hdel(`taurusmq:active:${this.queuename}`, job.id);
+                this.running--;
             }
         }
     }
