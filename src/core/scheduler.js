@@ -1,6 +1,9 @@
 const Redis = require("ioredis");
 const redis = require("../utils/redis");
 
+
+const rediskeydependent = `taurusmq:dependent:`;
+const rediskeyjob =  `taurusmq:job:`;
 class Scheduler {
     constructor(queuename, time) {
         this.queuename = queuename;
@@ -8,6 +11,7 @@ class Scheduler {
         this.rediskeyactive = `taurusmq:active:${queuename}`;
         this.rediskeydelayed = `taurusmq:delayed:${queuename}`;
         this.rediskeysignal = `taurusmq:signal:${queuename}`;
+        this.rediskeyblocked = `taurusmq:blocked:${queuename}`;
         this.active = true;
         this.timeout = time || 50000;
         this.client = new Redis(process.env.REDIS_URL, {

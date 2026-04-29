@@ -1,19 +1,23 @@
 const redis = require("../utils/redis");
 const Redis = require('ioredis');
 const Job = require("./job");
-const cron =require('cron-parser');
+const cron = require('cron-parser');
 
+
+const rediskeydependent = `taurusmq:dependent:`;
+const rediskeyjob =  `taurusmq:job:`;
 class Worker {
     constructor(queuename, handler , options = {}) {
         this.queuename = queuename;
         this.rediskey = `taurusmq:${queuename}`;
         this.rediskeysignal = `taurusmq:signal:${queuename}`;
         this.rediskeydelayed = `taurusmq:delayed:${queuename}`;
-        
+        this.rediskeyblocked = `taurusmq:blocked:${queuename}`;
         this.handler = handler;
         this.concurrency = options.concurrency || 1;
         this.running =0;
         this.active = true;
+        this.batchsize = options.batchsize || 1;
         this.client = new Redis(process.env.REDIS_URL, {
             maxRetriesPerRequest: null,
         });
@@ -27,6 +31,32 @@ class Worker {
     async work(id){
         while(this.active){
             let job = null;
+            if(this.batchsize>1){
+                let result = null;
+                 try {
+                    await this.client.blpop(this.rediskeysignal, 60);
+                    const result = await redis.batchdequeue(this.rediskey, `taurusmq:active:${this.queuename}`, this.rediskeysignal, this.batchsize);
+                
+                    if (result && result.length > 0) {
+                        const jobs = result.map(JSON.parse);
+                        await this.handler(jobs); 
+                        for (const job of jobs) {
+                            await this.finalizejob(job);
+                        }
+                    }
+                    continue;
+                }
+                catch(err){
+                    console.log( `batch job is failed moving to dlq`);
+                    for(let i=0;i<result.length;i++){
+                        let job = JSON.parse(result[i]);
+                        job.status = "dead";
+                        await redis.rpush(`taurusmq:dlq:${this.queuename}`, JSON.stringify(job));
+                        await redis.hdel(`taurusmq:active:${this.queuename}`, job.id);
+                    }
+                    continue;
+                }
+            }
             try {
                 await this.client.blpop(this.rediskeysignal, 60);
                 const jobjson = await redis.dequeue(
@@ -38,7 +68,8 @@ class Worker {
                     this.running++;
                     job = JSON.parse(jobjson);
                     await this.handler(job);
-                    await redis.hdel(`taurusmq:active:${this.queuename}`, job.id);
+                    await this.finalizejob(job);
+                    job.status = "done";
                     this.running--;
                     if(job.repeat){
                         try{
@@ -63,10 +94,12 @@ class Worker {
                 job.attempts++;
                 if (job.attempts <= job.maxretries) {
                     console.log(`retrying job ${job.id} (attempt ${job.attempts}/${job.maxretries})`);
+                    job.status = "retrying";
                     await redis.rpush(this.rediskey, JSON.stringify(job));
                 }
                 else {
                     console.log(`Job ${job.id} hit max limiting , moving to dlq`);
+                    job.status = "dead";
                     await redis.rpush(`taurusmq:dlq:${this.queuename}`, JSON.stringify(job));
                 }
                 await redis.hdel(`taurusmq:active:${this.queuename}`, job.id);
@@ -74,6 +107,24 @@ class Worker {
             }
         }
     }
+    async finalizejob(job){
+
+        await redis.hdel(`taurusmq:active:${this.queuename}`, job.id);
+        if(job.flow===true){
+            await redis.unblock(job.id, "parent", "children");
+        } 
+        else if(job.flow===false){
+            await redis.unblock(job.id, "children", "parent");
+        }
+        if (job.batchid) {
+            const remaining = await redis.decr(`taurusmq:batch:${job.batchid}:count`);
+            if(parseInt(remaining) === 0){
+                console.log(`Batch Completed: ${job.batchid}`);
+                await redis.del(`taurusmq:batch:${job.batchid}:count`);
+            }
+        }
+    }
+
 }
 
 module.exports = Worker;

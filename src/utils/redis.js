@@ -40,4 +40,16 @@ redis.defineCommand('signal', {
         fs.readFileSync(path.join(__dirname, '../lua/signal.lua'), 'utf-8')
 });
 
+redis.defineCommand('unblock', {
+    numberOfKeys: 1,
+    lua:
+        fs.readFileSync(path.join(__dirname, '../lua/unblock.lua'), 'utf-8')
+});
+
+redis.defineCommand('batchdequeue', {
+    numberOfKeys: 3,
+    lua:
+        fs.readFileSync(path.join(__dirname, '../lua/batchdequeue.lua'), 'utf-8')
+});
+
 module.exports = redis;
