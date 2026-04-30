@@ -13,11 +13,13 @@ class Worker {
         this.rediskeysignal = `taurusmq:signal:${queuename}`;
         this.rediskeydelayed = `taurusmq:delayed:${queuename}`;
         this.rediskeyblocked = `taurusmq:blocked:${queuename}`;
+        this.rediskeydlq = `taurusmq:dlq:${queuename}`;
         this.handler = handler;
         this.concurrency = options.concurrency || 1;
         this.running =0;
         this.active = true;
         this.batchsize = options.batchsize || 1;
+        this.backoffstrategies = options.backoffstrategies || {};
         this.client = new Redis(process.env.REDIS_URL, {
             maxRetriesPerRequest: null,
         });
@@ -91,16 +93,25 @@ class Worker {
             }
             catch (err) {
                 console.log(`job ${job.id} failed : `, err.message);
+                if(err.name=='Unrecoverable'){
+                    job.status = "dead";
+                    await redis.hdel(`taurusmq:active:${this.queuename}`, job.id);
+                    this.running--;
+                    return await redis.rpush(`taurusmq:dlq:${this.queuename}`, JSON.stringify(job)); 
+                }
                 job.attempts++;
-                if (job.attempts <= job.maxretries) {
-                    console.log(`retrying job ${job.id} (attempt ${job.attempts}/${job.maxretries})`);
+                if(job.attempts<=job.maxretries) {
+                    const delay = this.calculatebackoff(job);
+                    const nexttime = Date.now()+delay;
+                    console.log(`retrying job ${job.id} (attempt ${job.attempts}/${job.maxretries}) in ${delay/1000} sec..`);
                     job.status = "retrying";
-                    await redis.rpush(this.rediskey, JSON.stringify(job));
+                    await redis.zadd(this.rediskeydelayed, nexttime,JSON.stringify(job));
+                    await redis.signal(this.rediskeydelayed,this.rediskeysignal,nexttime);
                 }
                 else {
                     console.log(`Job ${job.id} hit max limiting , moving to dlq`);
                     job.status = "dead";
-                    await redis.rpush(`taurusmq:dlq:${this.queuename}`, JSON.stringify(job));
+                    await redis.hset(`taurusmq:dlq:${this.queuename}`, job.id, JSON.stringify(job));
                 }
                 await redis.hdel(`taurusmq:active:${this.queuename}`, job.id);
                 this.running--;
@@ -123,6 +134,21 @@ class Worker {
                 await redis.del(`taurusmq:batch:${job.batchid}:count`);
             }
         }
+    }
+    calculatebackoff(job) {
+        const backoff = job.backoff || {type : 'fixed', delay : 1000};
+        const attempts = job.attempts;
+        if(this.backoffstrategies[backoff.type]){
+            return this.backoffstrategies[backoff.type]
+            (attempts,backoff.delay);
+        }
+        if(backoff.type == 'fixed'){
+            return backoff.delay;
+        }
+        if(backoff.type=='exponential'){
+            return Math.pow(2,attempts-1)*backoff.delay;
+        }  
+        return 0; 
     }
 
 }

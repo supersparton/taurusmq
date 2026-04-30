@@ -52,4 +52,10 @@ redis.defineCommand('batchdequeue', {
         fs.readFileSync(path.join(__dirname, '../lua/batchdequeue.lua'), 'utf-8')
 });
 
+redis.defineCommand('retry', {
+    numberOfKeys: 3,
+    lua:
+        fs.readFileSync(path.join(__dirname, '../lua/retry.lua'), 'utf-8')
+});
+
 module.exports = redis;
