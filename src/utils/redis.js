@@ -23,7 +23,7 @@ redis.on('error', (err) => {
 });
 
 redis.defineCommand('dequeue', {
-    numberOfKeys: 2,
+    numberOfKeys: 3,
     lua:
         fs.readFileSync(path.join(__dirname, '../lua/dequeue.lua'), 'utf-8')
 });
@@ -53,7 +53,7 @@ redis.defineCommand('batchdequeue', {
 });
 
 redis.defineCommand('retry', {
-    numberOfKeys: 3,
+    numberOfKeys: 4,
     lua:
         fs.readFileSync(path.join(__dirname, '../lua/retry.lua'), 'utf-8')
 });

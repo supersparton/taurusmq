@@ -37,10 +37,13 @@ class Worker {
                 let result = null;
                  try {
                     await this.client.blpop(this.rediskeysignal, 60);
-                    const result = await redis.batchdequeue(this.rediskey, `taurusmq:active:${this.queuename}`, this.rediskeysignal, this.batchsize);
+                    const result = await redis.batchdequeue(this.rediskey, `taurusmq:active:${this.queuename}`, `taurusmq:jobs:${this.queuename}`, this.batchsize);
                 
                     if (result && result.length > 0) {
                         const jobs = result.map(JSON.parse);
+                        for (const job of jobs) {
+                            await this.scheduleNextRun(job);
+                        }
                         await this.handler(jobs); 
                         for (const job of jobs) {
                             await this.finalizejob(job);
@@ -53,7 +56,8 @@ class Worker {
                     for(let i=0;i<result.length;i++){
                         let job = JSON.parse(result[i]);
                         job.status = "dead";
-                        await redis.rpush(`taurusmq:dlq:${this.queuename}`, JSON.stringify(job));
+                        await this.client.hset(`taurusmq:jobs:${this.queuename}`, job.id, JSON.stringify(job));
+                        await redis.hset(`taurusmq:dlq:${this.queuename}`, job.id, JSON.stringify(job));
                         await redis.hdel(`taurusmq:active:${this.queuename}`, job.id);
                     }
                     continue;
@@ -64,40 +68,27 @@ class Worker {
                 const jobjson = await redis.dequeue(
                     this.rediskey,
                     `taurusmq:active:${this.queuename}`,
-                    Date.now()
+                    `taurusmq:jobs:${this.queuename}`
                 );
                 if (jobjson) {
                     this.running++;
                     job = JSON.parse(jobjson);
+                    await this.scheduleNextRun(job);
                     await this.handler(job);
                     await this.finalizejob(job);
                     job.status = "done";
                     this.running--;
-                    if(job.repeat){
-                        try{
-                            const interval = cron.CronExpressionParser.parse(job.repeat,{
-                                currentDate : new Date(job.timestamp)
-                            });
-                            const executetime = interval.next().getTime();
-                            const newjob = new Job(job.name,job.data);
-                            newjob.repeat = job.repeat;
-                            newjob.timestamp = executetime;
-                            await redis.signal(this.rediskeydelayed,this.rediskeysignal, executetime, newjob.toJson());
-                            console.log(`Scheduled next run for ${new Date(executetime).toLocaleTimeString()} in taurusmq:${this.queuename} of Job ${job.id}`);
-                        }
-                        catch(err){
-                            console.error("Cron rescheduling failed :", err.message, `for taurusmq:${this.queuename} of Job ${job.id}`);
-                        }
-                    }
                 }
             }
             catch (err) {
                 console.log(`job ${job.id} failed : `, err.message);
                 if(err.name=='Unrecoverable'){
                     job.status = "dead";
+                    await this.client.hset(`taurusmq:jobs:${this.queuename}`, job.id, JSON.stringify(job));
+                    await redis.hset(`taurusmq:dlq:${this.queuename}`, job.id, JSON.stringify(job));
                     await redis.hdel(`taurusmq:active:${this.queuename}`, job.id);
                     this.running--;
-                    return await redis.rpush(`taurusmq:dlq:${this.queuename}`, JSON.stringify(job)); 
+                    continue; 
                 }
                 job.attempts++;
                 if(job.attempts<=job.maxretries) {
@@ -105,12 +96,13 @@ class Worker {
                     const nexttime = Date.now()+delay;
                     console.log(`retrying job ${job.id} (attempt ${job.attempts}/${job.maxretries}) in ${delay/1000} sec..`);
                     job.status = "retrying";
-                    await redis.zadd(this.rediskeydelayed, nexttime,JSON.stringify(job));
-                    await redis.signal(this.rediskeydelayed,this.rediskeysignal,nexttime);
+                    await this.client.hset(`taurusmq:jobs:${this.queuename}`, job.id, JSON.stringify(job));
+                    await redis.signal(this.rediskeydelayed, this.rediskeysignal, nexttime, job.id);
                 }
                 else {
                     console.log(`Job ${job.id} hit max limiting , moving to dlq`);
                     job.status = "dead";
+                    await this.client.hset(`taurusmq:jobs:${this.queuename}`, job.id, JSON.stringify(job));
                     await redis.hset(`taurusmq:dlq:${this.queuename}`, job.id, JSON.stringify(job));
                 }
                 await redis.hdel(`taurusmq:active:${this.queuename}`, job.id);
@@ -135,6 +127,25 @@ class Worker {
             }
         }
     }
+    async scheduleNextRun(job) {
+        if (!job.repeat) return;
+        try {
+            const interval = cron.CronExpressionParser.parse(job.repeat, {
+                currentDate: new Date(job.timestamp)
+            });
+            const executetime = interval.next().getTime();
+            const newjob = new Job(job.name, job.data);
+            newjob.repeat = job.repeat;
+            newjob.timestamp = executetime;
+
+            await this.client.hset(`taurusmq:jobs:${this.queuename}`, newjob.id, newjob.toJson());
+            await redis.signal(this.rediskeydelayed, this.rediskeysignal, executetime, newjob.id);
+            console.log(`Scheduled next run for ${new Date(executetime).toLocaleTimeString()} in taurusmq:${this.queuename} of Job ${newjob.id}`);
+        } catch(err) {
+            console.error("Cron rescheduling failed:", err.message, `for taurusmq:${this.queuename} of Job ${job.id}`);
+        }
+    }
+
     calculatebackoff(job) {
         const backoff = job.backoff || {type : 'fixed', delay : 1000};
         const attempts = job.attempts;

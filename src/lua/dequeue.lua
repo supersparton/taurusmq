@@ -1,10 +1,10 @@
-local jobjson = redis.call('LPOP',KEYS[1])
+local jobid = redis.call('LPOP', KEYS[1])
 
-if jobjson then
-    local job = cjson.decode(jobjson)
-    local jobid = job.id
-    redis.call('HSET',KEYS[2],jobid,jobjson)
-    return jobjson
+if jobid then
+    local jobjson = redis.call('HGET', KEYS[3], jobid)
+    if jobjson then
+        redis.call('HSET', KEYS[2], jobid, jobjson)
+        return jobjson
+    end
 end
-
 return nil

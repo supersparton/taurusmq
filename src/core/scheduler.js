@@ -27,7 +27,8 @@ class Scheduler {
                     const job = JSON.parse(activejob[jobid]);
                     if (Date.now() - job.timestamp > this.timeout) {
                         console.log(`recovering job : ${jobid}`);
-                        await redis.rpush(this.rediskeywaiting, JSON.stringify(job));
+                        await redis.rpush(this.rediskeywaiting, jobid);
+                        await redis.lpush(this.rediskeysignal, 1);
                         await redis.hdel(this.rediskeyactive, jobid);
                     }
                 }

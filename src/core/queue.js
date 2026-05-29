@@ -24,9 +24,9 @@ class Queue {
             }
         }
         const j = new Job(name, data,options);
-        await redis.hset(this.rediskeyjobs,j.id,j.toJson);
+        await redis.hset(this.rediskeyjobs,j.id,j.toJson());
         if(j.parent && j.parent.length > 0) {
-            await redis.hset(this.rediskeyblocked, j.id);
+            await redis.hset(this.rediskeyblocked, j.id, 1);
             await redis.set(`taurusmq:job:${j.id}:count`, j.parent.length);
             await redis.set(`taurusmq:job:${j.id}:name`, this.queuename);
             for (let i = 0; i < j.parent.length; i++) {
@@ -62,16 +62,26 @@ class Queue {
         }
         const pipeline = redis.pipeline();
         pipeline.set(`taurusmq:batch:${batchid}:count`, jobsarray.length);
+        // Step 4 (Batch Cleanup): TTL of 7 days so batch trackers don't stay in Redis forever
+        pipeline.expire(`taurusmq:batch:${batchid}:count`, 7 * 24 * 60 * 60);
         for(let i=0;i<jobsarray.length;i++){
             const { name, data, options } = jobsarray[i];
             const j = new Job(name, data, options);
             j.batchid = batchid;
-            pipeline.rpush(this.rediskey,j.toJson());
+            pipeline.hset(this.rediskeyjobs,j.id,j.toJson());
+            pipeline.rpush(this.rediskey,j.id);
             pipeline.lpush(this.rediskeysignal,1);
         }
         await pipeline.exec();
         console.log("blunk running succesfully on",this.rediskey);
         return batchid;
+    }
+    async removeJob(jobid) {
+        // Fire & Forget: Let the Async Maintenance Engine handle the heavy deletion safely!
+        const task = { type: 'delete', jobId: jobid, queue: this.queuename };
+        await redis.rpush('taurusmq:_internal:maintenance', JSON.stringify(task));
+        console.log(`Task ${jobid} safely queued for background deletion.`);
+        return true;
     }
     async retry(jobid){
         const jobjson = await redis.hget(this.rediskeydlq,jobid);
@@ -81,7 +91,7 @@ class Queue {
         const job = JSON.parse(jobjson);
         job.status = "waiting";
         job.attempts = 0;
-        await redis.retry(this.rediskeydlq,this.rediskey,this.rediskeysignal,JSON.stringify(job),jobid);
+        await redis.retry(this.rediskeydlq, this.rediskey, this.rediskeysignal, this.rediskeyjobs, JSON.stringify(job), jobid);
         console.log(`${jobid} is retrying..`);
     }
 }
