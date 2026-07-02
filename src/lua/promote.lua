@@ -6,6 +6,7 @@ if #jobs>0 then
         redis.call('ZREM',KEYS[1],job);
     end
     redis.call('LPUSH', KEYS[3], #jobs) 
+    return jobs
 end
 
-return #jobs
+return {}

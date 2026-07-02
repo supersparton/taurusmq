@@ -10,6 +10,7 @@ class Queue {
         this.rediskey = `taurusmq:${queuename}`;
         this.rediskeyjobs = `taurusmq:jobs:${queuename}`;
         this.rediskeysignal = `taurusmq:signal:${queuename}`;
+        this.rediskeysignaldelayed = `taurusmq:signal:delayed:${queuename}`;
         this.rediskeyactive = `taurusmq:active:${queuename}`;
         this.rediskeydelayed = `taurusmq:delayed:${queuename}`;
         this.rediskeyblocked = `taurusmq:blocked:${queuename}`;
@@ -39,13 +40,13 @@ class Queue {
             const interval = cron.CronExpressionParser.parse(j.repeat);
             const executetime = interval.next().getTime();
             j.timestamp = executetime;
-            await redis.signal(this.rediskeydelayed, this.rediskeysignal, executetime, j.id);
+            await redis.signal(this.rediskeydelayed, this.rediskeysignaldelayed, executetime, j.id);
             return j.id;
         }
         else if (j.delay) {
             const executetime = Date.now() + j.delay;
             j.timestamp = executetime;
-            await redis.signal(this.rediskeydelayed, this.rediskeysignal, executetime, j.id);
+            await redis.signal(this.rediskeydelayed, this.rediskeysignaldelayed, executetime, j.id);
             console.log(`Job ${j.id} scueduled for ${new Date(executetime).toLocaleTimeString()}`);
         }
         else {

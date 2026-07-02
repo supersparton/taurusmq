@@ -11,6 +11,7 @@ class Worker {
         this.queuename = queuename;
         this.rediskey = `taurusmq:${queuename}`;
         this.rediskeysignal = `taurusmq:signal:${queuename}`;
+        this.rediskeysignaldelayed = `taurusmq:signal:delayed:${queuename}`;
         this.rediskeydelayed = `taurusmq:delayed:${queuename}`;
         this.rediskeyblocked = `taurusmq:blocked:${queuename}`;
         this.rediskeydlq = `taurusmq:dlq:${queuename}`;
@@ -32,6 +33,14 @@ class Worker {
     }
     async work(id){
         while(this.active){
+            try {
+                const isPaused = await this.client.get(`taurusmq:paused:${this.queuename}`) === '1';
+                if (isPaused) {
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    continue;
+                }
+            } catch (_) {}
+
             let job = null;
             if(this.batchsize>1){
                 let result = null;
@@ -97,7 +106,7 @@ class Worker {
                     console.log(`retrying job ${job.id} (attempt ${job.attempts}/${job.maxretries}) in ${delay/1000} sec..`);
                     job.status = "retrying";
                     await this.client.hset(`taurusmq:jobs:${this.queuename}`, job.id, JSON.stringify(job));
-                    await redis.signal(this.rediskeydelayed, this.rediskeysignal, nexttime, job.id);
+                    await redis.signal(this.rediskeydelayed, this.rediskeysignaldelayed, nexttime, job.id);
                 }
                 else {
                     console.log(`Job ${job.id} hit max limiting , moving to dlq`);
@@ -137,9 +146,10 @@ class Worker {
             const newjob = new Job(job.name, job.data);
             newjob.repeat = job.repeat;
             newjob.timestamp = executetime;
+            newjob.status = 'delayed';
 
             await this.client.hset(`taurusmq:jobs:${this.queuename}`, newjob.id, newjob.toJson());
-            await redis.signal(this.rediskeydelayed, this.rediskeysignal, executetime, newjob.id);
+            await redis.signal(this.rediskeydelayed, this.rediskeysignaldelayed, executetime, newjob.id);
             console.log(`Scheduled next run for ${new Date(executetime).toLocaleTimeString()} in taurusmq:${this.queuename} of Job ${newjob.id}`);
         } catch(err) {
             console.error("Cron rescheduling failed:", err.message, `for taurusmq:${this.queuename} of Job ${job.id}`);

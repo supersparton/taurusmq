@@ -11,6 +11,7 @@ class Scheduler {
         this.rediskeyactive = `taurusmq:active:${queuename}`;
         this.rediskeydelayed = `taurusmq:delayed:${queuename}`;
         this.rediskeysignal = `taurusmq:signal:${queuename}`;
+        this.rediskeysignaldelayed = `taurusmq:signal:delayed:${queuename}`;
         this.rediskeyblocked = `taurusmq:blocked:${queuename}`;
         this.active = true;
         this.timeout = time || 50000;
@@ -57,13 +58,17 @@ class Scheduler {
                     await new Promise(resolve=>setTimeout(resolve,waitms));
                 }
                 else{
-                    await this.client.blpop(this.rediskeysignal, Math.floor(waitms/1000));
+                    await this.client.blpop(this.rediskeysignaldelayed, Math.floor(waitms/1000));
                 }
              }
              catch(err){
                 console.log("Promotion error : ", err.message);
              }
          }
+    }
+    async stop() {
+        this.active = false;
+        this.client.disconnect();
     }
 }
 
