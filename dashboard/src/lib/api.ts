@@ -87,7 +87,7 @@ export interface QueueMetrics {
 }
 
 export const getQueues = ()               => apiFetch<QueueMetrics[]>('/api/queues');
-export const getQueue  = (name: string)   => apiFetch<QueueMetrics & { forecast: any }>(`/api/queues/${encodeURIComponent(name)}`);
+export const getQueue  = (name: string)   => apiFetch<QueueMetrics & { forecast: any; history?: any[] }>(`/api/queues/${encodeURIComponent(name)}`);
 export const getQueueErrors = (name: string) => apiFetch<{ message: string; count: number }[]>(`/api/queues/${encodeURIComponent(name)}/errors`);
 
 // ── Workers ────────────────────────────────────────────────────────────────────
@@ -145,4 +145,30 @@ export const cleanQueue = (queueName: string) =>
 export const retryJob = (queueName: string, jobId: string) =>
   apiFetch<{ ok: boolean }>(`/api/queues/${encodeURIComponent(queueName)}/jobs/${encodeURIComponent(jobId)}/retry`, {
     method: 'POST',
+  });
+
+export const replayJob = (queueName: string, jobId: string, data?: any) =>
+  apiFetch<{ ok: boolean; newJobId: string }>(`/api/queues/${encodeURIComponent(queueName)}/jobs/${encodeURIComponent(jobId)}/replay`, {
+    method: 'POST',
+    body: JSON.stringify({ data }),
+  });
+
+export interface SystemSettings {
+  host: string;
+  port: number;
+  status: string;
+  latency: string;
+  secretKey: string;
+  retentionDays: string;
+  maxMemory: string;
+  alertEmail: string;
+}
+
+export const getSystemSettings = () =>
+  apiFetch<SystemSettings>('/api/settings');
+
+export const saveSystemSettings = (settings: Partial<SystemSettings>) =>
+  apiFetch<{ ok: boolean }>('/api/settings', {
+    method: 'POST',
+    body: JSON.stringify(settings),
   });

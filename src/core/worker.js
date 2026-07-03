@@ -43,32 +43,36 @@ class Worker {
 
             let job = null;
             if(this.batchsize>1){
-                let result = null;
+                let batchResult = null;
                  try {
                     await this.client.blpop(this.rediskeysignal, 60);
-                    const result = await redis.batchdequeue(this.rediskey, `taurusmq:active:${this.queuename}`, `taurusmq:jobs:${this.queuename}`, this.batchsize);
+                    batchResult = await redis.batchdequeue(this.rediskey, `taurusmq:active:${this.queuename}`, `taurusmq:jobs:${this.queuename}`, this.batchsize);
                 
-                    if (result && result.length > 0) {
-                        const jobs = result.map(JSON.parse);
-                        for (const job of jobs) {
-                            await this.scheduleNextRun(job);
+                    if (batchResult && batchResult.length > 0) {
+                        const jobs = batchResult.map(JSON.parse);
+                        for (const j of jobs) {
+                            j.attempts = (j.attempts || 0) + 1;
+                            await this.scheduleNextRun(j);
                         }
-                        await this.handler(jobs); 
-                        for (const job of jobs) {
-                            await this.finalizejob(job);
+                        try {
+                            await this.handler(jobs); 
+                            for (const j of jobs) {
+                                await this.finalizejob(j);
+                            }
+                        } catch(err) {
+                            console.log(`batch job has failed moving to dlq`);
+                            for(const j of jobs) {
+                                j.status = "dead";
+                                await this.client.hset(`taurusmq:jobs:${this.queuename}`, j.id, JSON.stringify(j));
+                                await redis.hset(`taurusmq:dlq:${this.queuename}`, j.id, JSON.stringify(j));
+                                await redis.hdel(`taurusmq:active:${this.queuename}`, j.id);
+                            }
                         }
                     }
                     continue;
                 }
                 catch(err){
-                    console.log( `batch job is failed moving to dlq`);
-                    for(let i=0;i<result.length;i++){
-                        let job = JSON.parse(result[i]);
-                        job.status = "dead";
-                        await this.client.hset(`taurusmq:jobs:${this.queuename}`, job.id, JSON.stringify(job));
-                        await redis.hset(`taurusmq:dlq:${this.queuename}`, job.id, JSON.stringify(job));
-                        await redis.hdel(`taurusmq:active:${this.queuename}`, job.id);
-                    }
+                    console.log(`batch job error:`, err.message);
                     continue;
                 }
             }
@@ -82,6 +86,7 @@ class Worker {
                 if (jobjson) {
                     this.running++;
                     job = JSON.parse(jobjson);
+                    job.attempts++;
                     await this.scheduleNextRun(job);
                     await this.handler(job);
                     await this.finalizejob(job);
@@ -99,8 +104,7 @@ class Worker {
                     this.running--;
                     continue; 
                 }
-                job.attempts++;
-                if(job.attempts<=job.maxretries) {
+                if(job.attempts < job.maxretries) {
                     const delay = this.calculatebackoff(job);
                     const nexttime = Date.now()+delay;
                     console.log(`retrying job ${job.id} (attempt ${job.attempts}/${job.maxretries}) in ${delay/1000} sec..`);

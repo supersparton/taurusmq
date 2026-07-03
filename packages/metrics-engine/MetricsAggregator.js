@@ -146,6 +146,16 @@ class MetricsAggregator {
       'samplesCount',        String(samples.length),
       'updatedAt',           String(now),
     );
+
+    // ── 10. Record history point for charts (keeps last 60 points / 10 minutes) ──
+    const historyItem = JSON.stringify({
+      t: now,
+      throughput: Math.round(throughput * 100) / 100,
+      latency: Math.round(avgLatencyMs)
+    });
+    const histKey = `tmq:obs:metrics:${queue}:history`;
+    await redis.rpush(histKey, historyItem);
+    await redis.ltrim(histKey, -60, -1);
   }
 
   /**

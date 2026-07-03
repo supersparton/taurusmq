@@ -27,17 +27,21 @@ function patchQueue(QueueClass, bus) {
     const isDelayed = !!(options.delay || options.repeat);
     const hasParent = !!(options.parent && options.parent.length > 0);
 
-    if (isDelayed) {
-      const redis = require('../../../src/utils/redis');
-      try {
-        const rawJob = await redis.hget(this.rediskeyjobs, jobId);
-        if (rawJob) {
-          const parsed = JSON.parse(rawJob);
+    const redis = require('../../../src/utils/redis');
+    try {
+      const rawJob = await redis.hget(this.rediskeyjobs, jobId);
+      if (rawJob) {
+        const parsed = JSON.parse(rawJob);
+        if (isDelayed) {
           parsed.status = 'delayed';
-          await redis.hset(this.rediskeyjobs, jobId, JSON.stringify(parsed));
         }
-      } catch (_) {}
-    }
+        parsed.timeline = parsed.timeline || [];
+        if (!parsed.timeline.some(e => e.event === 'queued')) {
+          parsed.timeline.push({ event: 'queued', ts: parsed.timestamp ?? Date.now() });
+        }
+        await redis.hset(this.rediskeyjobs, jobId, JSON.stringify(parsed));
+      }
+    } catch (_) {}
 
     bus.emit(EventType.JOB_CREATED, {
       queueName: this.queuename,
@@ -59,6 +63,31 @@ function patchQueue(QueueClass, bus) {
 
     return jobId;
   };
+
+  // ── queue.addbulk → initialize timelines for batch jobs ──────────────
+  const origAddBulk = QueueClass.prototype.addbulk;
+  if (origAddBulk) {
+    QueueClass.prototype.addbulk = async function(jobsarray, options = {}) {
+      const batchId = await origAddBulk.call(this, jobsarray, options);
+      const redis = require('../../../src/utils/redis');
+      try {
+        const raw = await redis.hgetall(this.rediskeyjobs) ?? {};
+        const pipeline = redis.pipeline();
+        for (const [jobId, jobjson] of Object.entries(raw)) {
+          const p = JSON.parse(jobjson);
+          if (p.batchid === batchId) {
+            p.timeline = p.timeline || [];
+            if (!p.timeline.some(e => e.event === 'queued')) {
+              p.timeline.push({ event: 'queued', ts: p.timestamp ?? Date.now() });
+            }
+            pipeline.hset(this.rediskeyjobs, jobId, JSON.stringify(p));
+          }
+        }
+        await pipeline.exec();
+      } catch (_) {}
+      return batchId;
+    };
+  }
 
   // ── queue.retry → job.retry ──────────────────────────────────────────
   QueueClass.prototype.retry = async function(jobid) {

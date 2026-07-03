@@ -2,9 +2,9 @@
 import { use, useState, useEffect } from 'react';
 import Topbar from '@/components/layout/Topbar';
 import { fmtMs, fmtFullTimestamp, relativeTime, jobStateBadge, jobStateDotColor } from '@/lib/utils';
-import { RefreshCw, ChevronDown, ChevronRight, Copy, AlertTriangle, Clock, User, Zap, FileText, Lock } from 'lucide-react';
+import { RefreshCw, ChevronDown, ChevronRight, Copy, AlertTriangle, Clock, User, Zap, FileText, Lock, Play, Edit2, Check, X } from 'lucide-react';
 import { isFeatureEnabled } from '@/lib/features';
-import { getJob, retryJob, getWorkers } from '@/lib/api';
+import { getJob, retryJob, getWorkers, replayJob } from '@/lib/api';
 
 // ─── JSON Viewer — syntax-highlighted payload ────────────────────────────────
 function JsonValue({ value, depth = 0 }: { value: unknown; depth?: number }) {
@@ -99,13 +99,75 @@ function StackTrace({ frames }: { frames: string[] }) {
   );
 }
 
+// ─── Diagnostic Snapshot Panel ──────────────────────────────────────────────
+function SnapshotPanel({ snapshot }: { snapshot: any }) {
+  if (!snapshot) return <div style={{ fontSize: 11, color: 'var(--text-muted)', padding: 8 }}>No diagnostic snapshot captured.</div>;
+  return (
+    <div style={{ background: '#0b0f19', border: '1px solid var(--border)', borderRadius: 3, overflow: 'hidden' }}>
+      <div style={{ padding: '6px 10px', borderBottom: '1px solid var(--border)', fontSize: 11, color: 'var(--text-muted)', fontWeight: 600 }}>
+        Diagnostic Snapshot (Failure context)
+      </div>
+      <div style={{ padding: 10, display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid rgba(255,255,255,0.05)', paddingBottom: 4 }}>
+          <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>Worker Memory</span>
+          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, fontWeight: 600 }}>{snapshot.memory} MB</span>
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid rgba(255,255,255,0.05)', paddingBottom: 4 }}>
+          <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>Worker CPU Usage</span>
+          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, fontWeight: 600 }}>{snapshot.cpu}%</span>
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid rgba(255,255,255,0.05)', paddingBottom: 4 }}>
+          <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>Environment (NODE_ENV)</span>
+          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, fontWeight: 600 }}>{snapshot.env?.NODE_ENV}</span>
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', paddingBottom: 2 }}>
+          <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>Redis Connection</span>
+          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, fontWeight: 600, color: '#10b981' }}>{snapshot.redis?.status}</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Execution timeline — Datadog trace waterfall ─────────────────────────
 function ExecutionTimeline({ job }: { job: any }) {
-  const events = [
-    { label: 'Enqueued',    ts: job.timestamp,    color: '#64748b' },
-    job.processedOn ? { label: 'Started',   ts: job.processedOn!, color: '#3b82f6' } : null,
-    job.finishedOn  ? { label: job.state === 'failed' ? 'Failed' : 'Completed', ts: job.finishedOn!, color: job.state === 'failed' ? '#ef4444' : '#10b981' } : null,
-  ].filter(Boolean) as Array<{ label: string; ts: number; color: string }>;
+  let events: Array<{ label: string; ts: number; color: string; desc?: string }> = [];
+
+  if (job.timeline && job.timeline.length > 0) {
+    events = job.timeline.map((evt: any) => {
+      let label = evt.event.toUpperCase();
+      let color = '#64748b';
+      let desc = '';
+      if (evt.event === 'queued') {
+        label = 'Enqueued';
+        color = '#64748b';
+      } else if (evt.event === 'picked') {
+        label = 'Picked';
+        color = '#a855f7';
+        desc = evt.worker ? `by worker` : '';
+      } else if (evt.event === 'started') {
+        label = 'Started';
+        color = '#3b82f6';
+      } else if (evt.event === 'completed') {
+        label = 'Completed';
+        color = '#10b981';
+        desc = evt.durationMs ? `took ${fmtMs(evt.durationMs)}` : '';
+      } else if (evt.event === 'failed') {
+        label = 'Failed';
+        color = '#ef4444';
+        desc = evt.durationMs ? `took ${fmtMs(evt.durationMs)}` : '';
+      }
+      return { label, ts: evt.ts, color, desc };
+    });
+  } else {
+    events = [
+      { label: 'Enqueued',    ts: job.timestamp,    color: '#64748b' },
+      job.processedOn ? { label: 'Started',   ts: job.processedOn, color: '#3b82f6' } : null,
+      job.finishedOn  ? { label: job.state === 'failed' ? 'Failed' : 'Completed', ts: job.finishedOn, color: job.state === 'failed' ? '#ef4444' : '#10b981' } : null,
+    ].filter(Boolean) as Array<{ label: string; ts: number; color: string; desc?: string }>;
+  }
+
+  if (events.length === 0) return <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>No timeline data</div>;
 
   const start = events[0].ts;
   const end   = events[events.length - 1].ts;
@@ -115,15 +177,14 @@ function ExecutionTimeline({ job }: { job: any }) {
     <div style={{ padding: '0 2px' }}>
       {/* Waterfall bar */}
       <div style={{ position: 'relative', height: 6, background: 'var(--border)', borderRadius: 3, marginBottom: 16 }}>
-        {job.processedOn && job.finishedOn && (
+        {events.length > 1 && (
           <div style={{
             position: 'absolute',
-            left: `${((job.processedOn - start) / total) * 100}%`,
-            width: `${((job.finishedOn - job.processedOn) / total) * 100}%`,
+            left: '0%',
+            width: '100%',
             height: '100%',
-            background: job.state === 'failed' ? '#ef4444' : '#10b981',
+            background: job.state === 'failed' ? 'rgba(239, 68, 68, 0.4)' : 'rgba(16, 185, 129, 0.4)',
             borderRadius: 3,
-            minWidth: 3,
           }} />
         )}
       </div>
@@ -132,7 +193,9 @@ function ExecutionTimeline({ job }: { job: any }) {
         <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
           <div style={{ width: 8, height: 8, borderRadius: '50%', background: e.color, flexShrink: 0 }} />
           <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)' }}>{e.label}</div>
+            <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)' }}>
+              {e.label} {e.desc && <span style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 400, marginLeft: 4 }}>({e.desc})</span>}
+            </div>
             <div style={{ fontSize: 10.5, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
               {fmtFullTimestamp(e.ts)}
             </div>
@@ -163,6 +226,9 @@ export default function JobInspectorPage({ params }: { params: any }) {
   const [job, setJob] = useState<any>(null);
   const [workers, setWorkers] = useState<any[]>([]);
   const [actionMessage, setActionMessage] = useState('');
+  
+  const [isEditing, setIsEditing] = useState(false);
+  const [payloadText, setPayloadText] = useState('');
 
   const loadData = async () => {
     try {
@@ -172,7 +238,7 @@ export default function JobInspectorPage({ params }: { params: any }) {
       }
       const rawWorkers = await getWorkers();
       if (rawWorkers) {
-        setWorkers(rawWorkers.map(w => ({
+        setWorkers(rawWorkers.map((w: any) => ({
           id: w.id,
           hostname: w.host,
           pid: w.pid,
@@ -196,6 +262,12 @@ export default function JobInspectorPage({ params }: { params: any }) {
     return () => clearInterval(interval);
   }, [id]);
 
+  useEffect(() => {
+    if (job && !isEditing) {
+      setPayloadText(JSON.stringify(job.data, null, 2));
+    }
+  }, [job, isEditing]);
+
   const handleRetry = async () => {
     try {
       setActionMessage('Retrying job...');
@@ -205,6 +277,26 @@ export default function JobInspectorPage({ params }: { params: any }) {
       loadData();
     } catch (err: any) {
       setActionMessage(`Error retrying job: ${err.message}`);
+    }
+  };
+
+  const handleReplay = async () => {
+    try {
+      let parsed = null;
+      try {
+        parsed = JSON.parse(payloadText);
+      } catch (e: any) {
+        setActionMessage(`Invalid JSON payload: ${e.message}`);
+        return;
+      }
+      setActionMessage('Replaying job with modified payload...');
+      const res = await replayJob(job.queueName, job.id, parsed);
+      setActionMessage(`Replayed successfully! New Job ID: ${res.newJobId}`);
+      setIsEditing(false);
+      setTimeout(() => setActionMessage(''), 4000);
+      loadData();
+    } catch (err: any) {
+      setActionMessage(`Error replaying job: ${err.message}`);
     }
   };
 
@@ -221,7 +313,7 @@ export default function JobInspectorPage({ params }: { params: any }) {
     );
   }
 
-  const worker = workers.find(w => w.activeJobId === job.id);
+  const worker = workers.find((w: any) => w.activeJobId === job.id);
   const isDebuggerEnabled = isFeatureEnabled('PHASE_2_DEBUGGER');
 
   return (
@@ -254,7 +346,6 @@ export default function JobInspectorPage({ params }: { params: any }) {
             </div>
             <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
               <button className="btn btn-ghost" style={{ fontSize: 11 }} onClick={handleRetry}><RefreshCw size={11} /> Retry Job</button>
-              <button className="btn btn-danger" style={{ fontSize: 11 }}>Discard</button>
             </div>
           </div>
         )}
@@ -271,7 +362,6 @@ export default function JobInspectorPage({ params }: { params: any }) {
                   { label: 'Job ID', value: job.id },
                   { label: 'Name', value: job.name },
                   { label: 'Queue', value: job.queueName },
-                  { label: 'Priority', value: String(job.priority) },
                 ].map(({ label, value }) => (
                   <div key={label}>
                     <div style={{ fontSize: 10, color: 'var(--text-dim)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em' }}>{label}</div>
@@ -297,15 +387,6 @@ export default function JobInspectorPage({ params }: { params: any }) {
                     {job.attempts} <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>/ {job.maxAttempts}</span>
                   </div>
                 </div>
-                {job.progress > 0 && (
-                  <div>
-                    <div style={{ fontSize: 10, color: 'var(--text-dim)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 4 }}>Progress</div>
-                    <div style={{ height: 4, background: 'var(--border)', borderRadius: 2, overflow: 'hidden' }}>
-                      <div style={{ height: '100%', width: `${job.progress}%`, background: '#3b82f6', borderRadius: 2, transition: 'width 0.3s' }} />
-                    </div>
-                    <div style={{ fontSize: 11, color: '#3b82f6', marginTop: 2 }}>{job.progress}%</div>
-                  </div>
-                )}
               </div>
             </div>
 
@@ -340,32 +421,92 @@ export default function JobInspectorPage({ params }: { params: any }) {
           {/* CENTER — Payload + bottom logs */}
           <div style={{ display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
             <div style={{ flex: 1, overflowY: 'auto', padding: 12 }}>
-              <div className="panel" style={{ height: '100%' }}>
-                <div className="panel-header">
+              <div className="panel" style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+                <div className="panel-header" style={{ flexShrink: 0 }}>
                   <span className="panel-title"><FileText size={11} style={{ display: 'inline', marginRight: 4 }} />Job Payload</span>
-                  <button className="btn btn-ghost" style={{ fontSize: 11 }}><Copy size={10} /> Copy JSON</button>
-                </div>
-                <div className="panel-body">
-                  <div className="json-viewer">
-                    <JsonValue value={job.data} depth={0} />
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    {isDebuggerEnabled && (
+                      isEditing ? (
+                        <>
+                          <button className="btn btn-ghost" style={{ fontSize: 11, color: '#10b981' }} onClick={handleReplay}>
+                            <Play size={10} /> Submit Replay
+                          </button>
+                          <button className="btn btn-ghost" style={{ fontSize: 11, color: '#ef4444' }} onClick={() => setIsEditing(false)}>
+                            <X size={10} /> Cancel
+                          </button>
+                        </>
+                      ) : (
+                        <button className="btn btn-ghost" style={{ fontSize: 11 }} onClick={() => setIsEditing(true)}>
+                          <Edit2 size={10} /> Modify & Replay
+                        </button>
+                      )
+                    )}
                   </div>
+                </div>
+                <div className="panel-body" style={{ flex: 1, overflowY: 'auto' }}>
+                  {isEditing ? (
+                    <textarea
+                      value={payloadText}
+                      onChange={(e) => setPayloadText(e.target.value)}
+                      style={{
+                        width: '100%',
+                        height: '100%',
+                        minHeight: 250,
+                        outline: 'none',
+                        resize: 'none',
+                        background: '#07090d',
+                        border: '1px solid var(--border)',
+                        borderRadius: 3,
+                        padding: 8,
+                        color: '#10b981',
+                        fontFamily: 'var(--font-mono)',
+                        fontSize: 12,
+                        lineHeight: 1.5,
+                      }}
+                    />
+                  ) : (
+                    <div className="json-viewer">
+                      <JsonValue value={job.data} depth={0} />
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
 
             {/* Bottom: Stack trace / logs */}
-            <div style={{ height: 220, borderTop: '1px solid var(--border)', padding: 12, overflowY: 'auto', flexShrink: 0 }}>
+            <div style={{ height: 260, borderTop: '1px solid var(--border)', padding: 12, overflow: 'hidden', flexShrink: 0, display: 'grid', gridTemplateColumns: job.state === 'failed' ? '1fr 1fr' : '1fr', gap: 12 }}>
               {isDebuggerEnabled ? (
-                job.stacktrace && job.stacktrace.length > 0 ? (
-                  <StackTrace frames={job.stacktrace} />
-                ) : (
-                  <div className="terminal" style={{ height: '100%' }}>
-                    <div className="log-line"><span className="log-time">22:01:44</span><span className="log-info">[INFO]</span><span>Job completed successfully</span></div>
-                    <div className="log-line"><span className="log-time">22:01:43</span><span className="log-info">[INFO]</span><span>Processing step 3/3: send delivery</span></div>
-                    <div className="log-line"><span className="log-time">22:01:42</span><span className="log-info">[INFO]</span><span>Processing step 2/3: render template</span></div>
-                    <div className="log-line"><span className="log-time">22:01:41</span><span className="log-info">[INFO]</span><span>Job started by {job.workerId ?? 'wkr_unknown'}</span></div>
+                <>
+                  <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)', paddingBottom: 6, fontWeight: 600 }}>Console Output Logs</div>
+                    <div className="terminal" style={{ flex: 1, overflowY: 'auto', padding: 8 }}>
+                      {job.logs && job.logs.length > 0 ? (
+                        job.logs.map((log: any, idx: number) => (
+                          <div key={idx} className="log-line">
+                            <span className="log-time" style={{ color: 'var(--text-muted)', marginRight: 6 }}>{new Date(log.ts).toLocaleTimeString()}</span>
+                            <span className={`log-info log-${log.level}`} style={{ marginRight: 6, color: log.level === 'error' ? '#ef4444' : log.level === 'warn' ? '#f59e0b' : '#3b82f6' }}>
+                              [{log.level.toUpperCase()}]
+                            </span>
+                            <span>{log.message}</span>
+                          </div>
+                        ))
+                      ) : (
+                        <div style={{ color: 'var(--text-muted)', fontSize: 11, fontStyle: 'italic', padding: 8 }}>
+                          No console log outputs recorded for this job.
+                        </div>
+                      )}
+                    </div>
                   </div>
-                )
+
+                  {job.state === 'failed' && (
+                    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflowY: 'auto', gap: 12 }}>
+                      {job.stacktrace && job.stacktrace.length > 0 && (
+                        <StackTrace frames={job.stacktrace} />
+                      )}
+                      <SnapshotPanel snapshot={job.snapshot} />
+                    </div>
+                  )}
+                </>
               ) : (
                 <div style={{ height: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 6, color: 'var(--text-dim)' }}>
                   <Lock size={16} />

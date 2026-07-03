@@ -7,6 +7,37 @@
 const os            = require('os');
 const { EventType } = require('../types');
 
+const { AsyncLocalStorage } = require('async_hooks');
+
+const jobLogStorage = new AsyncLocalStorage();
+const origLog = console.log;
+const origWarn = console.warn;
+const origError = console.error;
+
+console.log = function(...args) {
+  origLog.apply(console, args);
+  const context = jobLogStorage.getStore();
+  if (context) {
+    context.logs.push({ level: 'log', message: args.map(x => typeof x === 'object' ? JSON.stringify(x) : String(x)).join(' '), ts: Date.now() });
+  }
+};
+
+console.warn = function(...args) {
+  origWarn.apply(console, args);
+  const context = jobLogStorage.getStore();
+  if (context) {
+    context.logs.push({ level: 'warn', message: args.map(x => typeof x === 'object' ? JSON.stringify(x) : String(x)).join(' '), ts: Date.now() });
+  }
+};
+
+console.error = function(...args) {
+  origError.apply(console, args);
+  const context = jobLogStorage.getStore();
+  if (context) {
+    context.logs.push({ level: 'error', message: args.map(x => typeof x === 'object' ? JSON.stringify(x) : String(x)).join(' '), ts: Date.now() });
+  }
+};
+
 /**
  * @param {Function} WorkerClass  - Worker constructor from src/core/worker.js
  * @param {Object}   bus          - ObservabilityBus singleton
@@ -90,6 +121,33 @@ function patchWorker(WorkerClass, bus) {
 
         // Update status to active in Redis jobs hash
         j.status = 'active';
+        j.processedOn = startMs;
+        j.timeline = j.timeline || [];
+        // Make sure we have the initial queued event
+        if (!j.timeline.some((e) => e.event === 'queued')) {
+          j.timeline.push({ event: 'queued', ts: j.timestamp ?? startMs - 100 });
+        }
+        j.timeline.push({ event: 'picked', ts: startMs - 5, worker: this._workerId });
+        j.timeline.push({ event: 'started', ts: startMs });
+
+        // Capture system resources for snapshotting
+        let cpuUsage = 0;
+        try {
+          const usage = process.cpuUsage();
+          cpuUsage = Math.round((usage.user + usage.system) / 10000) % 100;
+        } catch (_) {}
+
+        j.snapshot = {
+          cpu: cpuUsage,
+          memory: Math.round(process.memoryUsage().rss / 1024 / 1024),
+          env: {
+            NODE_ENV: process.env.NODE_ENV || 'development',
+          },
+          redis: {
+            status: this.client.status || 'ready',
+          },
+        };
+
         try {
           await this.client.hset(`taurusmq:jobs:${this.queuename}`, j.id, JSON.stringify(j));
         } catch (_) {}
@@ -100,16 +158,35 @@ function patchWorker(WorkerClass, bus) {
           jobName:    j.name,
           workerId:   this._workerId,
           workerHost: this._workerHost,
-          attempt:    (j.attempts ?? 0) + 1,
+          attempt:    j.attempts ?? 1,
         });
 
+        const logContext = { jobId: j.id, logs: [] };
+
         try {
-          const result = await origHandler(isArray ? j : j); // call original
+          const result = await jobLogStorage.run(logContext, async () => {
+            return await origHandler(isArray ? j : j);
+          });
           const durationMs = Date.now() - startMs;
           this._activeJobTimestamps.delete(j.id);
 
           // Update status to completed in Redis jobs hash
           j.status = 'completed';
+          j.finishedOn = Date.now();
+          j.duration = durationMs;
+          j.timeline = j.timeline || [];
+          j.timeline.push({ event: 'completed', ts: Date.now(), durationMs });
+
+          // Save logs to Redis
+          if (logContext.logs.length > 0) {
+            try {
+              const logKey = `taurusmq:logs:${this.queuename}:${j.id}`;
+              await this.client.del(logKey);
+              await this.client.rpush(logKey, ...logContext.logs.map((log) => JSON.stringify(log)));
+              await this.client.expire(logKey, 7 * 24 * 3600); // 7 days TTL
+            } catch (_) {}
+          }
+
           try {
             const pipe = this.client.pipeline();
             pipe.hset(`taurusmq:jobs:${this.queuename}`, j.id, JSON.stringify(j));
@@ -121,6 +198,7 @@ function patchWorker(WorkerClass, bus) {
               const evictedId = await this.client.rpop(`taurusmq:completed:${this.queuename}`);
               if (evictedId) {
                 await this.client.hdel(`taurusmq:jobs:${this.queuename}`, evictedId);
+                await this.client.del(`taurusmq:logs:${this.queuename}:${evictedId}`);
               }
             }
           } catch (_) {}
@@ -131,7 +209,7 @@ function patchWorker(WorkerClass, bus) {
             jobName:   j.name,
             workerId:  this._workerId,
             durationMs,
-            attempt:   (j.attempts ?? 0) + 1,
+            attempt:   j.attempts ?? 1,
             result:    null, // avoid serializing large results
           });
 
@@ -139,6 +217,25 @@ function patchWorker(WorkerClass, bus) {
         } catch (err) {
           const durationMs = Date.now() - startMs;
           this._activeJobTimestamps.delete(j.id);
+
+          // Update failure metrics on the job object
+          j.status = 'failed';
+          j.finishedOn = Date.now();
+          j.duration = durationMs;
+          j.timeline = j.timeline || [];
+          j.timeline.push({ event: 'failed', ts: Date.now(), durationMs });
+          j.stacktrace = err.stack ? err.stack.split('\n') : [err.message];
+          j.failedReason = err.message;
+
+          // Save logs to Redis
+          if (logContext.logs.length > 0) {
+            try {
+              const logKey = `taurusmq:logs:${this.queuename}:${j.id}`;
+              await this.client.del(logKey);
+              await this.client.rpush(logKey, ...logContext.logs.map((log) => JSON.stringify(log)));
+              await this.client.expire(logKey, 7 * 24 * 3600); // 7 days TTL
+            } catch (_) {}
+          }
 
           // Check if retries are paused for this queue
           let isPaused = false;
@@ -153,13 +250,17 @@ function patchWorker(WorkerClass, bus) {
           const willRetry = !isPaused && (j.attempts ?? 0) < (j.maxretries ?? 3)
             && err.name !== 'Unrecoverable';
 
+          try {
+            await this.client.hset(`taurusmq:jobs:${this.queuename}`, j.id, JSON.stringify(j));
+          } catch (_) {}
+
           bus.emit(EventType.JOB_FAILED, {
             queueName:    this.queuename,
             jobId:        j.id,
             jobName:      j.name,
             workerId:     this._workerId,
             durationMs,
-            attempt:      (j.attempts ?? 0) + 1,
+            attempt:      j.attempts ?? 1,
             failedReason: err.message,
             stack:        err.stack ?? null,
             willRetry,

@@ -98,7 +98,11 @@ const server = http.createServer(async (req, res) => {
       const name     = decodeURIComponent(queueMatch[1]);
       const metrics  = await readQueueMetrics(name);
       const forecast = await _forecasting.forecastQueue(name);
-      return json(res, { ...metrics, forecast });
+      const rawHistory = await redis.lrange(`tmq:obs:metrics:${name}:history`, 0, -1) ?? [];
+      const history = rawHistory.map(h => {
+        try { return JSON.parse(h); } catch { return null; }
+      }).filter(Boolean);
+      return json(res, { ...metrics, forecast, history });
     }
 
     // ── GET /api/queues/:name/errors ──────────────────────────────────────
@@ -138,6 +142,59 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && path === '/api/recommendations') {
       const firing = await _incidents.getFiringIncidents();
       return json(res, await _recommendations.generate(firing));
+    }
+
+    // ── GET /api/settings ─────────────────────────────────────────────────
+    if (req.method === 'GET' && path === '/api/settings') {
+      const startMs = Date.now();
+      let latencyStr = '0.5ms';
+      let status = 'disconnected';
+      try {
+        await redis.ping();
+        latencyStr = `${Date.now() - startMs}ms`;
+        status = 'connected';
+      } catch (err) {
+        latencyStr = 'unknown';
+      }
+      
+      const configStr = await redis.get('tmq:obs:settings:config');
+      const config = configStr ? JSON.parse(configStr) : {
+        retentionDays: '7',
+        maxMemory: '512MB',
+        alertEmail: 'admin@taurusmq.local'
+      };
+
+      return json(res, {
+        host: redis.options.host || '127.0.0.1',
+        port: redis.options.port || 6379,
+        status,
+        latency: latencyStr,
+        secretKey: 'tmq_sec_9F8H2S820DKS910398FJS82',
+        ...config
+      });
+    }
+
+    // ── POST /api/settings ────────────────────────────────────────────────
+    if (req.method === 'POST' && path === '/api/settings') {
+      let bodyData = {};
+      try {
+        const buffers = [];
+        for await (const chunk of req) {
+          buffers.push(chunk);
+        }
+        const data = Buffer.concat(buffers).toString();
+        if (data) {
+          bodyData = JSON.parse(data);
+        }
+      } catch (_) {}
+
+      await redis.set('tmq:obs:settings:config', JSON.stringify({
+        retentionDays: bodyData.retentionDays || '7',
+        maxMemory: bodyData.maxMemory || '512MB',
+        alertEmail: bodyData.alertEmail || 'admin@taurusmq.local'
+      }));
+
+      return json(res, { ok: true });
     }
 
     // ── GET /api/forecast ─────────────────────────────────────────────────
@@ -212,6 +269,10 @@ const server = http.createServer(async (req, res) => {
         const rawJson = await redis.hget(`taurusmq:jobs:${name}`, id);
         if (rawJson) {
           const p = JSON.parse(rawJson);
+          const rawLogs = await redis.lrange(`taurusmq:logs:${name}:${id}`, 0, -1);
+          const logs = (rawLogs || []).map(l => {
+            try { return JSON.parse(l); } catch (_) { return { level: 'log', message: l, ts: Date.now() }; }
+          });
           return json(res, {
             id: p.id,
             name: p.name || 'default',
@@ -221,13 +282,60 @@ const server = http.createServer(async (req, res) => {
             maxAttempts: p.maxretries ?? 3,
             timestamp: p.timestamp ?? Date.now(),
             failedReason: p.error || p.failedReason || '',
-            opts: p.opts || {},
-            data: p.data || {}
+            opts: p.opts || { maxretries: p.maxretries, parent: p.parent, repeat: p.repeat, batchid: p.batchid },
+            data: p.data || {},
+            processedOn: p.processedOn || null,
+            finishedOn: p.finishedOn || null,
+            duration: p.duration || null,
+            stacktrace: p.stacktrace || (p.stack ? p.stack.split('\n') : []),
+            timeline: p.timeline || [],
+            snapshot: p.snapshot || null,
+            logs
           });
         }
       }
       res.writeHead(404);
       return res.end(JSON.stringify({ error: 'Job not found' }));
+    }
+
+    // ── POST /api/queues/:name/jobs/:id/replay ──────────────────────────────
+    const replayJobMatch = path.match(/^\/api\/queues\/([^/]+)\/jobs\/([^/]+)\/replay$/);
+    if (req.method === 'POST' && replayJobMatch) {
+      const name = decodeURIComponent(replayJobMatch[1]);
+      const jobId = decodeURIComponent(replayJobMatch[2]);
+      
+      let bodyData = null;
+      try {
+        const buffers = [];
+        for await (const chunk of req) {
+          buffers.push(chunk);
+        }
+        const data = Buffer.concat(buffers).toString();
+        if (data) {
+          const parsed = JSON.parse(data);
+          bodyData = parsed.data;
+        }
+      } catch (_) {}
+
+      const jobjson = await redis.hget(`taurusmq:jobs:${name}`, jobId);
+      if (!jobjson) {
+        res.writeHead(404);
+        return res.end(JSON.stringify({ error: 'Original job not found' }));
+      }
+      
+      const originalJob = JSON.parse(jobjson);
+      const payload = (bodyData !== null && bodyData !== undefined) ? bodyData : originalJob.data;
+      
+      const Queue = require('../../src/core/queue');
+      const q = new Queue(name);
+      
+      const newJobId = await q.add(originalJob.name, payload, {
+        maxretries: originalJob.maxretries,
+        parent: originalJob.parent,
+        batchid: originalJob.batchid
+      });
+      
+      return json(res, { ok: true, newJobId });
     }
 
     // ── GET /api/jobs ──────────────────────────────────────────────────────

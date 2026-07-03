@@ -1,23 +1,72 @@
 // dashboard/src/app/settings/page.tsx
 'use client';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import Topbar from '@/components/layout/Topbar';
-import { Settings, Database, HardDrive, Key, Eye, EyeOff, Save, Check } from 'lucide-react';
+import { Settings, Database, HardDrive, Key, Eye, EyeOff, Save, Check, RefreshCw } from 'lucide-react';
+import { getSystemSettings, saveSystemSettings } from '@/lib/api';
 
 export default function SettingsPage() {
   const [showKey, setShowKey] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [loading, setLoading] = useState(true);
 
-  // Settings state
+  // Connection settings
+  const [host, setHost] = useState('127.0.0.1');
+  const [port, setPort] = useState(6379);
+  const [latency, setLatency] = useState('0ms');
+  const [status, setStatus] = useState('disconnected');
+  const [secretKey, setSecretKey] = useState('');
+
+  // Settings form state
   const [retentionDays, setRetentionDays] = useState('7');
   const [maxMemory, setMaxMemory] = useState('512MB');
   const [alertEmail, setAlertEmail] = useState('admin@taurusmq.local');
 
-  const handleSave = (e: React.FormEvent) => {
-    e.preventDefault();
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
+  const fetchSettings = async () => {
+    try {
+      setLoading(true);
+      const res = await getSystemSettings();
+      setHost(res.host);
+      setPort(res.port);
+      setLatency(res.latency);
+      setStatus(res.status);
+      setSecretKey(res.secretKey);
+      setRetentionDays(res.retentionDays);
+      setMaxMemory(res.maxMemory);
+      setAlertEmail(res.alertEmail);
+    } catch (err) {
+      console.error('Failed to load system settings:', err);
+    } finally {
+      setLoading(false);
+    }
   };
+
+  useEffect(() => {
+    fetchSettings();
+  }, []);
+
+  const handleSave = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      await saveSystemSettings({ retentionDays, maxMemory, alertEmail });
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch (err) {
+      console.error('Failed to save settings:', err);
+    }
+  };
+
+  if (loading && !secretKey) {
+    return (
+      <>
+        <Topbar title="Settings" subtitle="Configure system limits, Redis connections, and API keys" />
+        <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: 300, color: 'var(--text-muted)' }}>
+          <RefreshCw size={24} className="animate-spin" style={{ marginRight: 8 }} />
+          Loading settings...
+        </div>
+      </>
+    );
+  }
 
   return (
     <>
@@ -35,21 +84,34 @@ export default function SettingsPage() {
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
               <div>
                 <label style={{ fontSize: 11, color: 'var(--text-dim)', fontWeight: 600, display: 'block', marginBottom: 4 }}>HOST / URI</label>
-                <input type="text" readOnly value="127.0.0.1" 
+                <input type="text" readOnly value={host} 
                   style={{ width: '100%', padding: '6px 10px', background: 'var(--bg-base)', border: '1px solid var(--border)', borderRadius: 3, color: 'var(--text-secondary)', fontSize: 12, fontFamily: 'var(--font-mono)' }} />
               </div>
               <div>
                 <label style={{ fontSize: 11, color: 'var(--text-dim)', fontWeight: 600, display: 'block', marginBottom: 4 }}>PORT</label>
-                <input type="text" readOnly value="6379" 
+                <input type="text" readOnly value={port} 
                   style={{ width: '100%', padding: '6px 10px', background: 'var(--bg-base)', border: '1px solid var(--border)', borderRadius: 3, color: 'var(--text-secondary)', fontSize: 12, fontFamily: 'var(--font-mono)' }} />
               </div>
             </div>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(16,185,129,0.06)', border: '1px solid rgba(16,185,129,0.2)', padding: '8px 12px', borderRadius: 3, marginTop: 4 }}>
+            <div style={{ 
+              display: 'flex', 
+              justifyContent: 'space-between', 
+              alignItems: 'center', 
+              background: status === 'connected' ? 'rgba(16,185,129,0.06)' : 'rgba(239,68,68,0.06)', 
+              border: status === 'connected' ? '1px solid rgba(16,185,129,0.2)' : '1px solid rgba(239,68,68,0.2)', 
+              padding: '8px 12px', 
+              borderRadius: 3, 
+              marginTop: 4 
+            }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#10b981' }} />
-                <span style={{ fontSize: 12, fontWeight: 600, color: '#10b981' }}>Connection Status: Active</span>
+                <span style={{ width: 8, height: 8, borderRadius: '50%', background: status === 'connected' ? '#10b981' : '#ef4444' }} />
+                <span style={{ fontSize: 12, fontWeight: 600, color: status === 'connected' ? '#10b981' : '#ef4444' }}>
+                  Connection Status: {status === 'connected' ? 'Active' : 'Disconnected'}
+                </span>
               </div>
-              <span style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>Ping latency: 1.4ms</span>
+              <span style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
+                Ping latency: {latency}
+              </span>
             </div>
           </div>
         </div>
@@ -66,7 +128,7 @@ export default function SettingsPage() {
               Use this secret key to authenticate your jobs and queue workers with the TaurusMQ API. Keep this key confidential.
             </p>
             <div style={{ display: 'flex', gap: 6 }}>
-              <input type={showKey ? 'text' : 'password'} readOnly value="tmq_sec_9F8H2S820DKS910398FJS82" 
+              <input type={showKey ? 'text' : 'password'} readOnly value={secretKey} 
                 style={{ flex: 1, padding: '6px 10px', background: 'var(--bg-base)', border: '1px solid var(--border)', borderRadius: 3, color: 'var(--text-secondary)', fontSize: 12, fontFamily: 'var(--font-mono)' }} />
               <button className="btn btn-ghost" onClick={() => setShowKey(!showKey)} style={{ width: 34, height: 32, padding: 0, justifyContent: 'center' }}>
                 {showKey ? <EyeOff size={14} /> : <Eye size={14} />}

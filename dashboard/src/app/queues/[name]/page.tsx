@@ -1,7 +1,6 @@
 'use client';
 import { use } from 'react';
 import Topbar from '@/components/layout/Topbar';
-import { throughputSeries, latencySeries } from '@/lib/mockData';
 import { QUEUE_RISKS, CAPACITY_FORECASTS, RECOMMENDED_ACTIONS, QUEUE_DEPS } from '@/lib/intelligence';
 import { fmtMs, fmtNum, fmtPercent, relativeTime, jobStateBadge, jobStateDotColor, healthScoreColor } from '@/lib/utils';
 import { AreaSeries } from '@/components/charts/ChartPrimitives';
@@ -37,7 +36,7 @@ function HealthRing({ score, size = 72 }: { score: number; size?: number }) {
 
 const STATE_TABS: JobState[] = ['active', 'waiting', 'delayed', 'failed', 'completed'];
 
-import { getQueues, getQueueJobs, retryFailedJobs, cleanQueue, pauseRetries, retryJob, getWorkers } from '@/lib/api';
+import { getQueue, getQueueJobs, retryFailedJobs, cleanQueue, pauseRetries, retryJob, getWorkers } from '@/lib/api';
 import { isFeatureEnabled } from '@/lib/features';
 
 export default function QueueDetailPage({ params }: { params: any }) {
@@ -47,38 +46,40 @@ export default function QueueDetailPage({ params }: { params: any }) {
   const [jobs, setJobs] = useState<any[]>([]);
   const [workers, setWorkers] = useState<any[]>([]);
   const [activeTab, setActiveTab] = useState<JobState>('active');
+  const [selectedFailureGroup, setSelectedFailureGroup] = useState<string | null>(null);
+  const [history, setHistory] = useState<any[]>([]);
   const [actionMessage, setActionMessage] = useState('');
 
   const loadData = async () => {
     try {
-      const [allQueues, rawJobs, rawWorkers] = await Promise.all([
-        getQueues(),
+      const [queueData, rawJobs, rawWorkers] = await Promise.all([
+        getQueue(name),
         getQueueJobs(name),
         getWorkers()
       ]);
       
-      if (allQueues) {
-        const found = allQueues.find(queue => queue.name === name);
-        if (found) {
-          setQ({
-            name: found.name,
-            health: found.healthScore >= 80 ? 'healthy' : found.healthScore >= 50 ? 'degraded' : 'critical',
-            healthScore: found.healthScore ?? 100,
-            isPaused: found.isPaused ?? false,
-            counts: {
-              waiting: found.waiting ?? 0,
-              active: found.active ?? 0,
-              delayed: found.delayed ?? 0,
-              failed: found.failed ?? 0,
-              completed: found.completed ?? 0,
-            },
-            throughput: found.throughput ?? 0,
-            avgLatency: found.avgLatencyMs ?? 0,
-            p99Latency: found.p99LatencyMs ?? 0,
-            errorRate: found.errorRate ?? 0,
-            retryRate: found.retryRate ?? 0,
-            workerCount: found.workerCount ?? 0,
-          });
+      if (queueData) {
+        setQ({
+          name: queueData.name,
+          health: queueData.healthScore >= 80 ? 'healthy' : queueData.healthScore >= 50 ? 'degraded' : 'critical',
+          healthScore: queueData.healthScore ?? 100,
+          isPaused: queueData.isPaused ?? false,
+          counts: {
+            waiting: queueData.waiting ?? 0,
+            active: queueData.active ?? 0,
+            delayed: queueData.delayed ?? 0,
+            failed: queueData.failed ?? 0,
+            completed: queueData.completed ?? 0,
+          },
+          throughput: queueData.throughput ?? 0,
+          avgLatency: queueData.avgLatencyMs ?? 0,
+          p99Latency: queueData.p99LatencyMs ?? 0,
+          errorRate: queueData.errorRate ?? 0,
+          retryRate: queueData.retryRate ?? 0,
+          workerCount: queueData.workerCount ?? 0,
+        });
+        if (queueData.history) {
+          setHistory(queueData.history);
         }
       }
       if (rawJobs) {
@@ -172,6 +173,61 @@ export default function QueueDetailPage({ params }: { params: any }) {
   };
 
   const queueJobs = jobs.filter(j => j.state === activeTab);
+  
+  // Calculate failure groups from failed jobs
+  const failedJobs = jobs.filter(j => j.state === 'failed');
+  const failureGroups = failedJobs.reduce((acc, job) => {
+    const reason = job.failedReason || 'Unknown Error';
+    let groupKey = 'Unknown Error';
+    if (reason.toLowerCase().includes('timeout') || reason.toLowerCase().includes('conn')) {
+      groupKey = 'Timeout / Connection Error';
+    } else if (reason.toLowerCase().includes('validation') || reason.toLowerCase().includes('invalid')) {
+      groupKey = 'Validation Error';
+    } else if (reason.toLowerCase().includes('redis')) {
+      groupKey = 'Redis Broker Error';
+    } else if (reason.toLowerCase().includes('db') || reason.toLowerCase().includes('sql') || reason.toLowerCase().includes('database')) {
+      groupKey = 'Database Exception';
+    } else {
+      groupKey = reason.substring(0, 50) + (reason.length > 50 ? '...' : '');
+    }
+
+    if (!acc[groupKey]) {
+      acc[groupKey] = { key: groupKey, count: 0, jobs: [] };
+    }
+    acc[groupKey].count++;
+    acc[groupKey].jobs.push(job);
+    return acc;
+  }, {} as Record<string, { key: string; count: number; jobs: any[] }>);
+
+  const failureGroupsArray = (Object.values(failureGroups) as Array<{ key: string; count: number; jobs: any[] }>).sort((a, b) => b.count - a.count);
+
+  const displayedJobs = (activeTab === 'failed' && selectedFailureGroup)
+    ? queueJobs.filter(j => {
+        const reason = j.failedReason || 'Unknown Error';
+        let groupKey = 'Unknown Error';
+        if (reason.toLowerCase().includes('timeout') || reason.toLowerCase().includes('conn')) {
+          groupKey = 'Timeout / Connection Error';
+        } else if (reason.toLowerCase().includes('validation') || reason.toLowerCase().includes('invalid')) {
+          groupKey = 'Validation Error';
+        } else if (reason.toLowerCase().includes('redis')) {
+          groupKey = 'Redis Broker Error';
+        } else if (reason.toLowerCase().includes('db') || reason.toLowerCase().includes('sql') || reason.toLowerCase().includes('database')) {
+          groupKey = 'Database Exception';
+        } else {
+          groupKey = reason.substring(0, 50) + (reason.length > 50 ? '...' : '');
+        }
+        return groupKey === selectedFailureGroup;
+      })
+    : queueJobs;
+
+  const liveThroughputSeries = history.length > 0 
+    ? history.map(pt => ({ t: pt.t, v: pt.throughput }))
+    : Array.from({ length: 30 }, (_, i) => ({ t: Date.now() - (30 - i) * 10000, v: q ? q.throughput : 0 }));
+
+  const liveLatencySeries = history.length > 0 
+    ? history.map(pt => ({ t: pt.t, v: pt.latency }))
+    : Array.from({ length: 30 }, (_, i) => ({ t: Date.now() - (30 - i) * 10000, v: q ? q.avgLatency : 0 }));
+
   const isIncidentsEnabled = isFeatureEnabled('PHASE_3_INCIDENT_CENTER');
   const isAnalyticsEnabled = isFeatureEnabled('PHASE_4_ANALYTICS');
   const isFlowEnabled = isFeatureEnabled('PHASE_5_FLOW_VISUALIZATION');
@@ -331,7 +387,7 @@ export default function QueueDetailPage({ params }: { params: any }) {
           <div className="panel">
             <div className="panel-header"><span className="panel-title">Throughput Trend</span></div>
             <div style={{ padding: '6px 10px 4px' }}>
-              <AreaSeries data={throughputSeries.slice(-30)} color="#06b6d4" name="jobs/min" height={110} formatter={v => `${v.toFixed(0)}/min`} />
+              <AreaSeries data={liveThroughputSeries} color="#06b6d4" name="jobs/min" height={110} formatter={v => `${v.toFixed(0)}/min`} />
             </div>
           </div>
           
@@ -342,7 +398,7 @@ export default function QueueDetailPage({ params }: { params: any }) {
               {q.p99Latency > 10000 && <span style={{ fontSize: 10, color: '#ef4444' }}>⚠ SLA breach</span>}
             </div>
             <div style={{ padding: '6px 10px 4px' }}>
-              <AreaSeries data={latencySeries.slice(-30)} color="#ef4444" name="ms" height={110} formatter={fmtMs} threshold={2000} thresholdLabel="SLA 2s" />
+              <AreaSeries data={liveLatencySeries} color="#ef4444" name="ms" height={110} formatter={fmtMs} threshold={2000} thresholdLabel="SLA 2s" />
             </div>
           </div>
 
@@ -427,7 +483,7 @@ export default function QueueDetailPage({ params }: { params: any }) {
                 <button
                   key={s}
                   className={`filter-chip ${s === activeTab ? 'active' : ''}`}
-                  onClick={() => setActiveTab(s)}
+                  onClick={() => { setActiveTab(s); setSelectedFailureGroup(null); }}
                   style={{ fontSize: 11 }}
                 >
                   {s} <span style={{ fontVariantNumeric: 'tabular-nums' }}>{q.counts[s as keyof typeof q.counts] ?? 0}</span>
@@ -435,13 +491,52 @@ export default function QueueDetailPage({ params }: { params: any }) {
               ))}
             </div>
           </div>
+
+          {/* Failure Groups Aggregator */}
+          {activeTab === 'failed' && failureGroupsArray.length > 0 && (
+            <div style={{ padding: '10px 14px', borderBottom: '1px solid var(--border)', background: 'rgba(239, 68, 68, 0.02)' }}>
+              <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-dim)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                Failure Groups (Select to filter)
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                {failureGroupsArray.map(group => {
+                  const isSelected = selectedFailureGroup === group.key;
+                  return (
+                    <div
+                      key={group.key}
+                      onClick={() => setSelectedFailureGroup(isSelected ? null : group.key)}
+                      style={{
+                        background: isSelected ? 'rgba(239, 68, 68, 0.15)' : 'var(--bg-base)',
+                        border: isSelected ? '1px solid #ef4444' : '1px solid var(--border)',
+                        borderRadius: 4,
+                        padding: '6px 10px',
+                        cursor: 'pointer',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 8,
+                        transition: 'all 0.15s ease',
+                      }}
+                    >
+                      <span style={{ fontSize: 11, fontWeight: 600, color: isSelected ? '#fca5a5' : 'var(--text-secondary)' }}>
+                        {group.key}
+                      </span>
+                      <span style={{ fontSize: 9.5, background: 'rgba(239, 68, 68, 0.25)', color: '#ef4444', padding: '1px 5px', borderRadius: 8, fontWeight: 700 }}>
+                        {group.count}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           <div style={{ overflowX: 'auto', maxHeight: 300, overflowY: 'auto' }}>
             <table className="data-table">
               <thead><tr><th>Job ID</th><th>Name</th><th>State</th><th>Attempts</th><th>Age</th><th>Failure Reason</th><th>Actions</th></tr></thead>
               <tbody>
-                {queueJobs.length === 0
+                {displayedJobs.length === 0
                   ? <tr><td colSpan={7} style={{ textAlign: 'center', color: 'var(--text-muted)', padding: 24 }}>No jobs</td></tr>
-                  : queueJobs.map(job => (
+                  : displayedJobs.map(job => (
                     <tr key={job.id}>
                       <td><Link href={`/jobs/${job.id}`} style={{ color: 'var(--accent-blue)', fontFamily: 'var(--font-mono)', fontSize: 11.5 }}>{job.id}</Link></td>
                       <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>{job.name}</td>

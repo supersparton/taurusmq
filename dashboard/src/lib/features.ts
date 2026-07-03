@@ -6,8 +6,8 @@ export const FEATURES = {
   // Phase 1: Core Observability (MVP) - ENABLED
   PHASE_1_MVP: true,
 
-  // Phase 2: Debugger (Execution timeline, in-UI logs, stack traces, replay, failure groups) - DISABLED
-  PHASE_2_DEBUGGER: false,
+  // Phase 2: Debugger (Execution timeline, in-UI logs, stack traces, replay, failure groups) - ENABLED
+  PHASE_2_DEBUGGER: true,
 
   // Phase 3: Incident Center (Playbook recommendations, firing incidents, alerts history) - DISABLED
   PHASE_3_INCIDENT_CENTER: false,

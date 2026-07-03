@@ -1,32 +1,39 @@
 'use client';
 import { useEffect, useRef, useState } from 'react';
 import Topbar from '@/components/layout/Topbar';
-import { EVENTS } from '@/lib/mockData';
+import { getEvents } from '@/lib/api';
 import { fmtTimestamp, eventTypeColor } from '@/lib/utils';
 import { Pause, Play, Download, Filter } from 'lucide-react';
 import type { EventStreamItem } from '@/lib/types';
 import { isFeatureEnabled } from '@/lib/features';
 import FeatureLocked from '@/components/layout/FeatureLocked';
 
-// Simulate incoming events by cycling through mock data
 function useEventStream(paused: boolean) {
-  const [events, setEvents] = useState<EventStreamItem[]>([...EVENTS]);
-  const idx = useRef(0);
+  const [events, setEvents] = useState<EventStreamItem[]>([]);
 
   useEffect(() => {
-    if (paused) return;
-    const templates = EVENTS;
-    const id = setInterval(() => {
-      const base = templates[idx.current % templates.length];
-      const newEvent: EventStreamItem = {
-        ...base,
-        id: `ev_live_${Date.now()}`,
-        ts: Date.now(),
-      };
-      idx.current++;
-      setEvents(prev => [newEvent, ...prev].slice(0, 200));
-    }, 2000 + Math.random() * 3000);
-    return () => clearInterval(id);
+    let active = true;
+    
+    const fetchEvents = async () => {
+      if (paused) return;
+      try {
+        const list = await getEvents(Date.now() - 3600000, Date.now(), 200);
+        if (active && list) {
+          const sorted = [...list].sort((a, b) => b.ts - a.ts);
+          setEvents(sorted);
+        }
+      } catch (err) {
+        // quiet fallback
+      }
+    };
+
+    fetchEvents();
+    const id = setInterval(fetchEvents, 2500);
+
+    return () => {
+      active = false;
+      clearInterval(id);
+    };
   }, [paused]);
 
   return events;
@@ -54,7 +61,13 @@ export default function StreamPage() {
   const events = useEventStream(paused);
 
   const filtered = filter
-    ? events.filter(e => e.message.toLowerCase().includes(filter.toLowerCase()) || e.queueName.includes(filter))
+    ? events.filter(e => {
+        const msg = (e.message || '').toLowerCase();
+        const qName = (e.queueName || '').toLowerCase();
+        const jId = (e.jobId || '').toLowerCase();
+        const term = filter.toLowerCase();
+        return msg.includes(term) || qName.includes(term) || jId.includes(term);
+      })
     : events;
 
   if (!enabled) {
