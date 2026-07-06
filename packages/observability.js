@@ -45,6 +45,7 @@ async function attachObservability({
   queues      = [],
   port        = parseInt(process.env.OBS_PORT ?? '4000', 10),
   projectRoot = process.cwd(),
+  patchConsole = true,
 }) {
   // 1. Initialize credentials in memory
   const setup     = new SetupManager(projectRoot);
@@ -53,7 +54,7 @@ async function attachObservability({
 
   // 2. Patch Queue, Worker, and Scheduler to emit observability events
   patchQueue(Queue, bus);
-  patchWorker(Worker, bus);
+  patchWorker(Worker, bus, { patchConsole });
 
   const SchedulerClass = Scheduler || require('../src/core/scheduler');
   if (SchedulerClass) {

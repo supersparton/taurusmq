@@ -1,14 +1,20 @@
-const redis = require("../utils/redis");
-const Redis = require('ioredis');
+const { getRedisClient } = require("../utils/redis");
 
 class Maintenance {
     constructor(options = {}) {
-        this.client = new Redis(process.env.REDIS_URL, {
-            maxRetriesPerRequest: null,
-        });
-        this.active = true;
+        this.prefix = options.prefix || 'taurusmq';
         this.zombieTimeout = options.zombieTimeout || 24 * 60 * 60 * 1000; // default 24 hours
         this.checkInterval = options.checkInterval || 60 * 1000; // default 1 minute
+        this.active = true;
+        
+        this.connectionOpts = options.connection;
+        this.redisClient = getRedisClient(this.connectionOpts);
+        this.client = getRedisClient(this.connectionOpts, true);
+
+        this.maintenanceTimer = null;
+        this.maintenanceResolve = null;
+        this.zombieTimer = null;
+        this.zombieResolve = null;
     }
 
     async start() {
@@ -21,7 +27,31 @@ class Maintenance {
 
     async stop() {
         this.active = false;
-        this.client.disconnect();
+        if (this.client) {
+            this.client.disconnect(false);
+        }
+        if (this.maintenanceTimer) {
+            clearTimeout(this.maintenanceTimer);
+            this.maintenanceTimer = null;
+        }
+        if (this.maintenanceResolve) {
+            this.maintenanceResolve();
+            this.maintenanceResolve = null;
+        }
+        if (this.zombieTimer) {
+            clearTimeout(this.zombieTimer);
+            this.zombieTimer = null;
+        }
+        if (this.zombieResolve) {
+            this.zombieResolve();
+            this.zombieResolve = null;
+        }
+
+        const redisProxy = require("../utils/redis");
+        const connectionIsShared = (this.connectionOpts && typeof this.connectionOpts.duplicate === 'function') || (this.redisClient === redisProxy);
+        if (!connectionIsShared && this.redisClient) {
+            try { this.redisClient.disconnect(); } catch (_) {}
+        }
     }
 
     // 1. Cascading Deletions (From the _internal queue)
@@ -29,7 +59,7 @@ class Maintenance {
         while (this.active) {
             try {
                 // Wait for a task, timeout every 5s so we can check if still active
-                const result = await this.client.blpop('taurusmq:_internal:maintenance', 5);
+                const result = await this.client.blpop(`${this.prefix}:_internal:maintenance`, 5);
                 if (result) {
                     const task = JSON.parse(result[1]);
                     
@@ -39,7 +69,16 @@ class Maintenance {
                 }
             } catch (err) {
                 console.error("Maintenance loop error:", err.message);
-                await new Promise(r => setTimeout(r, 5000));
+                if (this.active) {
+                    await new Promise(r => {
+                        this.maintenanceResolve = r;
+                        this.maintenanceTimer = setTimeout(() => {
+                            r();
+                            this.maintenanceResolve = null;
+                            this.maintenanceTimer = null;
+                        }, 5000);
+                    });
+                }
             }
         }
     }
@@ -47,37 +86,48 @@ class Maintenance {
     async handleDeletion(startJobId, queueName) {
         const idsToDelete = [];
         const queue = [startJobId];
+        const visited = new Set([startJobId]);
 
         // Iterative BFS to find all children without Call Stack Overflow
         while (queue.length > 0) {
             const currentId = queue.shift();
             idsToDelete.push(currentId);
 
-            const children = await redis.smembers(`taurusmq:dependent:${currentId}:children:`);
+            const children = await this.redisClient.smembers(`${this.prefix}:dependent:${currentId}:children:`);
             if (children && children.length > 0) {
-                queue.push(...children);
+                for (const childId of children) {
+                    if (!visited.has(childId)) {
+                        visited.add(childId);
+                        queue.push(childId);
+                    }
+                }
             }
         }
 
         // Delete all found jobs atomically using a Pipeline
-        const pipeline = redis.pipeline();
+        const pipeline = this.redisClient.pipeline();
         
         for (const id of idsToDelete) {
             // A. Clean up Dependencies & Tracking
-            pipeline.del(`taurusmq:dependent:${id}:children:`);
-            pipeline.del(`taurusmq:dependent:${id}:parent:`);
-            pipeline.del(`taurusmq:job:${id}:count`);
-            pipeline.del(`taurusmq:job:${id}:name`);
+            pipeline.del(`${this.prefix}:dependent:${id}:children:`);
+            pipeline.del(`${this.prefix}:dependent:${id}:parent:`);
+            pipeline.del(`${this.prefix}:job:${id}:count`);
+            pipeline.del(`${this.prefix}:job:${id}:name`);
             
             // B. Remove from ALL queue states
-            pipeline.lrem(`taurusmq:${queueName}`, 0, id); 
-            pipeline.zrem(`taurusmq:delayed:${queueName}`, id);
-            pipeline.hdel(`taurusmq:active:${queueName}`, id);
-            pipeline.hdel(`taurusmq:dlq:${queueName}`, id);
-            pipeline.hdel(`taurusmq:blocked:${queueName}`, id);
+            pipeline.lrem(`${this.prefix}:${queueName}`, 0, id); 
+            pipeline.zrem(`${this.prefix}:delayed:${queueName}`, id);
+            pipeline.zrem(`${this.prefix}:active:${queueName}`, id);
+            pipeline.zrem(`${this.prefix}:completed:${queueName}`, id);
+            pipeline.zrem(`${this.prefix}:failed:${queueName}`, id);
+            pipeline.hdel(`${this.prefix}:dlq:${queueName}`, id);
+            pipeline.hdel(`${this.prefix}:blocked:${queueName}`, id);
             
             // C. Remove the actual payload from the Job Vault
-            pipeline.hdel(`taurusmq:jobs:${queueName}`, id);
+            pipeline.hdel(`${this.prefix}:jobs:${queueName}`, id);
+            
+            // D. Publish removed event to pubsub channel
+            pipeline.publish(`${this.prefix}:${queueName}:events`, JSON.stringify({ event: 'removed', jobId: id }));
         }
 
         await pipeline.exec();
@@ -91,36 +141,38 @@ class Maintenance {
                 // Scan for any active queues in the system
                 let cursor = '0';
                 do {
-                    const [newCursor, keys] = await redis.scan(cursor, 'MATCH', 'taurusmq:active:*', 'COUNT', 100);
+                    const [newCursor, keys] = await this.redisClient.scan(cursor, 'MATCH', `${this.prefix}:active:*`, 'COUNT', 100);
                     cursor = newCursor;
 
                     for (const activeKey of keys) {
-                        const queueName = activeKey.split(':')[2];
-                        const activeJobs = await redis.hgetall(activeKey);
+                        const queueName = activeKey.replace(`${this.prefix}:active:`, '');
+                        const activeJobs = await this.redisClient.zrange(activeKey, 0, -1);
                         
                         const now = Date.now();
-                        for (const [jobId, _] of Object.entries(activeJobs)) {
-                            const jobJson = await redis.hget(`taurusmq:jobs:${queueName}`, jobId);
+                        for (const jobId of activeJobs) {
+                            const jobJson = await this.redisClient.hget(`${this.prefix}:jobs:${queueName}`, jobId);
                             
                             if (jobJson) {
                                 const job = JSON.parse(jobJson);
                                 
-                                // If the job has been active for more than zombieTimeout
-                                if (now - job.timestamp > this.zombieTimeout) {
+                                // If the job has been actively processing for more than zombieTimeout.
+                                const activeStartTime = job.processedOn || job.timestamp;
+                                if (now - activeStartTime > this.zombieTimeout) {
                                     console.log(`🧟 Zombie detected! Job ${jobId} in ${queueName} exceeded timeout. Moving to DLQ.`);
                                     job.status = 'dead';
                                     job.error = 'Zombie timeout exceeded. Worker probably crashed.';
                                     
-                                    const pipeline = redis.pipeline();
-                                    pipeline.hset(`taurusmq:jobs:${queueName}`, jobId, JSON.stringify(job)); // Update vault
-                                    pipeline.hset(`taurusmq:dlq:${queueName}`, jobId, JSON.stringify(job)); // Store in DLQ
-                                    pipeline.hdel(activeKey, jobId); // Remove from active
+                                    const pipeline = this.redisClient.pipeline();
+                                    pipeline.hset(`${this.prefix}:jobs:${queueName}`, jobId, JSON.stringify(job)); // Update vault
+                                    pipeline.hset(`${this.prefix}:dlq:${queueName}`, jobId, JSON.stringify(job)); // Store in DLQ
+                                    pipeline.zrem(activeKey, jobId); // Remove from active ZSET
+                                    pipeline.zadd(`${this.prefix}:failed:${queueName}`, now, jobId); // Add to failed index ZSET
                                     await pipeline.exec();
                                 }
                             } else {
-                                // Data is gone from vault, but it's stuck in active hash
+                                // Data is gone from vault, but it's stuck in active ZSET
                                 console.log(`🧹 Maintenance: Removing ghost job ${jobId} from active state.`);
-                                await redis.hdel(activeKey, jobId);
+                                await this.redisClient.zrem(activeKey, jobId);
                             }
                         }
                     }
@@ -131,7 +183,16 @@ class Maintenance {
             }
             
             // Sleep for the interval before checking again
-            await new Promise(r => setTimeout(r, this.checkInterval));
+            if (this.active) {
+                await new Promise(r => {
+                    this.zombieResolve = r;
+                    this.zombieTimer = setTimeout(() => {
+                        r();
+                        this.zombieResolve = null;
+                        this.zombieTimer = null;
+                    }, this.checkInterval);
+                });
+            }
         }
     }
 }

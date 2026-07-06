@@ -1,7 +1,7 @@
 'use strict';
 
-const { Queue, Worker, Scheduler } = require('./src/index');
-const { attachObservability } = require('./packages/observability');
+const { Queue, Worker, Scheduler } = require('../src/index');
+const { attachObservability } = require('../packages/observability');
 
 const authDisabled = process.env.TAURUSMQ_AUTH_DISABLED === 'true';
 if (!authDisabled) {
@@ -44,7 +44,7 @@ async function main() {
       console.log(`[Worker] Enqueued child-task-1 (ID: ${child1Id}) with 5s delay`);
       console.log(`[Worker] Enqueued child-task-2 (ID: ${child2Id}) with 5s delay`);
     } else if (job.name === 'child-task-1' || job.name === 'child-task-2') {
-      const redis = require('./src/utils/redis');
+      const redis = require('../src/utils/redis');
       const count = await redis.incr(`complex-test:finished:${iteration}`);
       
       console.log(`[Worker] Child task completed. Iteration ${iteration} progress: ${count}/2`);
@@ -91,7 +91,7 @@ async function main() {
     clearInterval(interval);
     console.log('\n🧹 Cleaning up test data and freeing Redis memory...');
     try {
-      const redis = require('./src/utils/redis');
+      const redis = require('../src/utils/redis');
       await redis.flushdb();
       console.log('✅ Redis memory cleared successfully.');
 

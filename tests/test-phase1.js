@@ -10,8 +10,8 @@
 
 'use strict';
 
-const { Queue, Worker, Scheduler } = require('./src/index');
-const { attachObservability } = require('./packages/observability');
+const { Queue, Worker, Scheduler } = require('../src/index');
+const { attachObservability } = require('../packages/observability');
 
 
 const authDisabled = process.env.TAURUSMQ_AUTH_DISABLED === 'true';
@@ -116,7 +116,7 @@ async function main() {
     clearInterval(interval);
     console.log('\n🧹 Cleaning up test data and freeing Redis memory...');
     try {
-      const redis = require('./src/utils/redis');
+      const redis = require('../src/utils/redis');
       
       // Flush database keys to free all memory
       await redis.flushdb();

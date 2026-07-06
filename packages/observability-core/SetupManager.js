@@ -10,6 +10,7 @@
 'use strict';
 
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 
 class SetupManager {
   /**
@@ -43,8 +44,18 @@ class SetupManager {
 
     if (envUsername && envPassword) {
       this.username = envUsername;
-      this.passwordPlain = envPassword;
-      this.jwtSecret = envSecret || 'default-fallback-jwt-secret-key-12345';
+      // Hash password immediately to clear it from heap memory
+      this.passwordHash = await bcrypt.hash(envPassword, 10);
+      this.passwordPlain = null;
+      if (!envSecret) {
+        if (process.env.NODE_ENV === 'production') {
+          throw new Error('[TaurusMQ Error] TAURUSMQ_JWT_SECRET environment variable is required in production.');
+        }
+        // Generate secure dynamic random JWT secret
+        this.jwtSecret = crypto.randomBytes(32).toString('hex');
+      } else {
+        this.jwtSecret = envSecret;
+      }
       console.log('[obs] Credentials loaded from Environment Variables');
       console.log(`[obs] Dashboard user: ${this.username}`);
       return { jwtSecret: this.jwtSecret, username: this.username, project: 'local' };

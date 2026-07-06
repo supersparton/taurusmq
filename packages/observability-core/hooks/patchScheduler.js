@@ -19,11 +19,13 @@ function patchScheduler(SchedulerClass, bus) {
 
   const origPromote = redis.promote;
   if (typeof origPromote === 'function') {
-    redis.promote = async function(delayedKey, waitingKey, signalKey, nowTime) {
-      const promotedJobs = await origPromote.call(redis, delayedKey, waitingKey, signalKey, nowTime);
+    redis.promote = async function(...args) {
+      const promotedJobs = await origPromote.apply(redis, args);
       
       if (Array.isArray(promotedJobs) && promotedJobs.length > 0) {
-        const queueName = delayedKey.replace('taurusmq:delayed:', '');
+        const delayedKey = args[0];
+        const parts = delayedKey.split(':');
+        const queueName = parts[parts.length - 1];
         for (const jobId of promotedJobs) {
           bus.emit(EventType.JOB_PROMOTED, { queueName, jobId });
         }

@@ -13,36 +13,46 @@ const jobLogStorage = new AsyncLocalStorage();
 const origLog = console.log;
 const origWarn = console.warn;
 const origError = console.error;
+let isConsolePatched = false;
 
-console.log = function(...args) {
-  origLog.apply(console, args);
-  const context = jobLogStorage.getStore();
-  if (context) {
-    context.logs.push({ level: 'log', message: args.map(x => typeof x === 'object' ? JSON.stringify(x) : String(x)).join(' '), ts: Date.now() });
-  }
-};
+function patchConsole() {
+  if (isConsolePatched) return;
+  isConsolePatched = true;
 
-console.warn = function(...args) {
-  origWarn.apply(console, args);
-  const context = jobLogStorage.getStore();
-  if (context) {
-    context.logs.push({ level: 'warn', message: args.map(x => typeof x === 'object' ? JSON.stringify(x) : String(x)).join(' '), ts: Date.now() });
-  }
-};
+  console.log = function(...args) {
+    origLog.apply(console, args);
+    const context = jobLogStorage.getStore();
+    if (context) {
+      context.logs.push({ level: 'log', message: args.map(x => typeof x === 'object' ? JSON.stringify(x) : String(x)).join(' '), ts: Date.now() });
+    }
+  };
 
-console.error = function(...args) {
-  origError.apply(console, args);
-  const context = jobLogStorage.getStore();
-  if (context) {
-    context.logs.push({ level: 'error', message: args.map(x => typeof x === 'object' ? JSON.stringify(x) : String(x)).join(' '), ts: Date.now() });
-  }
-};
+  console.warn = function(...args) {
+    origWarn.apply(console, args);
+    const context = jobLogStorage.getStore();
+    if (context) {
+      context.logs.push({ level: 'warn', message: args.map(x => typeof x === 'object' ? JSON.stringify(x) : String(x)).join(' '), ts: Date.now() });
+    }
+  };
+
+  console.error = function(...args) {
+    origError.apply(console, args);
+    const context = jobLogStorage.getStore();
+    if (context) {
+      context.logs.push({ level: 'error', message: args.map(x => typeof x === 'object' ? JSON.stringify(x) : String(x)).join(' '), ts: Date.now() });
+    }
+  };
+}
 
 /**
  * @param {Function} WorkerClass  - Worker constructor from src/core/worker.js
  * @param {Object}   bus          - ObservabilityBus singleton
+ * @param {Object}   [options]    - Optional settings
  */
-function patchWorker(WorkerClass, bus) {
+function patchWorker(WorkerClass, bus, options = {}) {
+  if (options.patchConsole !== false && process.env.TAURUSMQ_DISABLE_CONSOLE_PATCH !== 'true') {
+    patchConsole();
+  }
   const origStart = WorkerClass.prototype.start;
   const origWork  = WorkerClass.prototype.work;
 
@@ -107,11 +117,12 @@ function patchWorker(WorkerClass, bus) {
   };
 
   // ── Worker.work inner job lifecycle → job.active, job.completed, job.failed ─
-  WorkerClass.prototype.work = async function(id) {
+  WorkerClass.prototype.work = async function(id, slotClient) {
     const origHandler = this.handler;
 
     // Wrap the user-provided handler to intercept start/end
     this.handler = async (job) => {
+      const prefix  = this.prefix || 'taurusmq';
       const isArray = Array.isArray(job);
       const jobs    = isArray ? job : [job];
 
@@ -144,12 +155,12 @@ function patchWorker(WorkerClass, bus) {
             NODE_ENV: process.env.NODE_ENV || 'development',
           },
           redis: {
-            status: this.client.status || 'ready',
+            status: this.redisClient.status || 'ready',
           },
         };
 
         try {
-          await this.client.hset(`taurusmq:jobs:${this.queuename}`, j.id, JSON.stringify(j));
+          await this.redisClient.hset(`${prefix}:jobs:${this.queuename}`, j.id, JSON.stringify(j));
         } catch (_) {}
 
         bus.emit(EventType.JOB_ACTIVE, {
@@ -162,6 +173,19 @@ function patchWorker(WorkerClass, bus) {
         });
 
         const logContext = { jobId: j.id, logs: [] };
+        j.log = async (message) => {
+          try {
+            const logLine = {
+              level: 'log',
+              message: typeof message === 'object' ? JSON.stringify(message) : String(message),
+              ts: Date.now()
+            };
+            logContext.logs.push(logLine);
+            const logKey = `${prefix}:logs:${this.queuename}:${j.id}`;
+            await this.redisClient.rpush(logKey, JSON.stringify(logLine));
+            await this.redisClient.expire(logKey, 7 * 24 * 3600);
+          } catch (_) {}
+        };
 
         try {
           const result = await jobLogStorage.run(logContext, async () => {
@@ -174,33 +198,25 @@ function patchWorker(WorkerClass, bus) {
           j.status = 'completed';
           j.finishedOn = Date.now();
           j.duration = durationMs;
+          // Persist the handler's return value so it's readable from the dashboard
+          j.returnvalue = (result !== undefined) ? result : null;
           j.timeline = j.timeline || [];
           j.timeline.push({ event: 'completed', ts: Date.now(), durationMs });
 
           // Save logs to Redis
           if (logContext.logs.length > 0) {
             try {
-              const logKey = `taurusmq:logs:${this.queuename}:${j.id}`;
-              await this.client.del(logKey);
-              await this.client.rpush(logKey, ...logContext.logs.map((log) => JSON.stringify(log)));
-              await this.client.expire(logKey, 7 * 24 * 3600); // 7 days TTL
+              const logKey = `${prefix}:logs:${this.queuename}:${j.id}`;
+              await this.redisClient.del(logKey);
+              await this.redisClient.rpush(logKey, ...logContext.logs.map((log) => JSON.stringify(log)));
+              await this.redisClient.expire(logKey, 7 * 24 * 3600); // 7 days TTL
             } catch (_) {}
           }
 
           try {
-            const pipe = this.client.pipeline();
-            pipe.hset(`taurusmq:jobs:${this.queuename}`, j.id, JSON.stringify(j));
-            pipe.lpush(`taurusmq:completed:${this.queuename}`, j.id);
-            pipe.llen(`taurusmq:completed:${this.queuename}`);
-            const results = await pipe.exec();
-            const len = results && results[2] && results[2][1];
-            if (len > 100) {
-              const evictedId = await this.client.rpop(`taurusmq:completed:${this.queuename}`);
-              if (evictedId) {
-                await this.client.hdel(`taurusmq:jobs:${this.queuename}`, evictedId);
-                await this.client.del(`taurusmq:logs:${this.queuename}:${evictedId}`);
-              }
-            }
+            // Strip the updateProgress function before serialising
+            const { updateProgress: _drop, ...jobData } = j;
+            await this.redisClient.hset(`${prefix}:jobs:${this.queuename}`, j.id, JSON.stringify(jobData));
           } catch (_) {}
 
           bus.emit(EventType.JOB_COMPLETED, {
@@ -210,7 +226,7 @@ function patchWorker(WorkerClass, bus) {
             workerId:  this._workerId,
             durationMs,
             attempt:   j.attempts ?? 1,
-            result:    null, // avoid serializing large results
+            result,  // actual return value, not null
           });
 
           return result;
@@ -230,17 +246,17 @@ function patchWorker(WorkerClass, bus) {
           // Save logs to Redis
           if (logContext.logs.length > 0) {
             try {
-              const logKey = `taurusmq:logs:${this.queuename}:${j.id}`;
-              await this.client.del(logKey);
-              await this.client.rpush(logKey, ...logContext.logs.map((log) => JSON.stringify(log)));
-              await this.client.expire(logKey, 7 * 24 * 3600); // 7 days TTL
+              const logKey = `${prefix}:logs:${this.queuename}:${j.id}`;
+              await this.redisClient.del(logKey);
+              await this.redisClient.rpush(logKey, ...logContext.logs.map((log) => JSON.stringify(log)));
+              await this.redisClient.expire(logKey, 7 * 24 * 3600); // 7 days TTL
             } catch (_) {}
           }
 
           // Check if retries are paused for this queue
           let isPaused = false;
           try {
-            isPaused = await this.client.get(`tmq:obs:paused-retries:${this.queuename}`) === '1';
+            isPaused = await this.redisClient.get(`tmq:obs:paused-retries:${this.queuename}`) === '1';
           } catch (_) {}
 
           if (isPaused) {
@@ -251,7 +267,9 @@ function patchWorker(WorkerClass, bus) {
             && err.name !== 'Unrecoverable';
 
           try {
-            await this.client.hset(`taurusmq:jobs:${this.queuename}`, j.id, JSON.stringify(j));
+            // Strip updateProgress before serialising to Redis
+            const { updateProgress: _drop, ...jobData } = j;
+            await this.redisClient.hset(`${prefix}:jobs:${this.queuename}`, j.id, JSON.stringify(jobData));
           } catch (_) {}
 
           bus.emit(EventType.JOB_FAILED, {
@@ -272,12 +290,17 @@ function patchWorker(WorkerClass, bus) {
       }
     };
 
-    return origWork.call(this, id);
+    return origWork.call(this, id, slotClient);
   };
 
   // ── Worker.stop (if implemented) → worker.stopped ────────────────────
-  WorkerClass.prototype.stop = function() {
-    this.active = false;
+  const origStop = WorkerClass.prototype.stop;
+  WorkerClass.prototype.stop = async function() {
+    if (origStop) {
+      await origStop.call(this);
+    } else {
+      this.active = false;
+    }
     clearInterval(this._heartbeatInterval);
     clearInterval(this._resourceInterval);
 

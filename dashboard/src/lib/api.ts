@@ -11,11 +11,19 @@ async function apiFetch<T>(
   path: string,
   init: RequestInit = {}
 ): Promise<T> {
+  const isMutating = init.method && !['GET', 'OPTIONS', 'HEAD'].includes(init.method.toUpperCase());
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (isMutating) {
+    headers['X-TaurusMQ-CSRF'] = '1';
+  }
+
   const res = await fetch(`${API_BASE}${path}`, {
     ...init,
     credentials: 'include',           // send httpOnly cookie automatically
     headers: {
-      'Content-Type': 'application/json',
+      ...headers,
       ...(init.headers ?? {}),
     },
   });

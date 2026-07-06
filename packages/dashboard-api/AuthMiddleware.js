@@ -20,6 +20,7 @@
 'use strict';
 
 const jwt = require('jsonwebtoken');
+const redis = require('../../src/utils/redis');
 
 const COOKIE_NAME  = 'tmq_token';
 const JWT_EXPIRES  = '24h';
@@ -79,10 +80,28 @@ function clearCookie() {
  * @param {string} jwtSecret
  * @returns {{ handleLogin, handleMe, handleLogout, requireAuth }}
  */
-function createAuth(setup, jwtSecret) {
+function createAuth(setup, jwtSecret, allowedOrigins = []) {
 
   // ── POST /api/auth/login ─────────────────────────────────────────────
   async function handleLogin(req, res) {
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+    const limitKey = `taurusmq:obs:ratelimit:login:${ip}`;
+    const now = Date.now();
+    try {
+      const [allowed, waitTime] = await redis.rateLimit(limitKey, now, 60000, 5); // 5 attempts per minute
+      if (allowed === 0) {
+        res.writeHead(429, { 
+          'Content-Type': 'application/json',
+          'Retry-After': Math.ceil(waitTime / 1000)
+        });
+        return res.end(JSON.stringify({ 
+          error: `Too many login attempts. Please try again in ${Math.ceil(waitTime / 1000)} seconds.` 
+        }));
+      }
+    } catch (err) {
+      console.error('[obs] Login rate limiter error:', err);
+    }
+
     let body = '';
     req.on('data', chunk => { body += chunk; });
     await new Promise(resolve => req.on('end', resolve));
@@ -168,6 +187,23 @@ function createAuth(setup, jwtSecret) {
     }
     const routeKey = `${req.method} ${new URL(req.url, 'http://localhost').pathname}`;
     if (PUBLIC_ROUTES.has(routeKey)) return true; // skip check
+
+    // CSRF and Origin checks on state-mutating requests
+    if (!['GET', 'OPTIONS', 'HEAD'].includes(req.method)) {
+      const csrfHeader = req.headers['x-taurusmq-csrf'];
+      const requestedWith = req.headers['x-requested-with'];
+      if (!csrfHeader && requestedWith !== 'XMLHttpRequest') {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'CSRF validation failed: Missing custom headers' }));
+        return null;
+      }
+      const origin = req.headers.origin;
+      if (origin && !allowedOrigins.includes(origin)) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'CSRF validation failed: Origin not allowed' }));
+        return null;
+      }
+    }
 
     const cookies = parseCookies(req.headers.cookie);
     const token   = cookies[COOKIE_NAME];

@@ -1,10 +1,16 @@
 {
   "name": "taurusmq",
   "version": "1.0.0",
-  "description": "**A Distributed Background Job Engine built with Node.js and Redis.**",
   "main": "index.js",
+  "workspaces": [
+    "dashboard"
+  ],
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node run-all-tests.js",
+    "test:coverage": "node --test --experimental-test-coverage tests/test-fault-tolerance.js",
+    "dev:dashboard": "cd dashboard && npm run dev",
+    "dev:api": "node tests/test-complex.js",
+    "dev": "node scripts/dev.js"
   },
   "keywords": [],
   "author": "",

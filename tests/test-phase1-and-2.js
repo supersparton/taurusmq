@@ -16,10 +16,10 @@
 
 'use strict';
 
-const { Queue, Worker, Scheduler } = require('./src/index');
-const { attachObservability } = require('./packages/observability');
-const redis = require('./src/utils/redis');
-const { MetricsAggregator } = require('./packages/metrics-engine/MetricsAggregator');
+const { Queue, Worker, Scheduler } = require('../src/index');
+const { attachObservability } = require('../packages/observability');
+const redis = require('../src/utils/redis');
+const { MetricsAggregator } = require('../packages/metrics-engine/MetricsAggregator');
 
 const queueName = 'unified-test-queue';
 

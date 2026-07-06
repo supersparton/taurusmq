@@ -56,16 +56,30 @@ let _auth = null;
 const server = http.createServer(async (req, res) => {
   const origin = req.headers.origin ?? '';
 
-  // CORS — allow only configured origins (never wildcard on auth-protected server)
-  const corsOrigin = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
-
   res.setHeader('Content-Type', 'application/json');
-  res.setHeader('Access-Control-Allow-Origin', corsOrigin);
-  res.setHeader('Access-Control-Allow-Credentials', 'true');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  // Secure headers (Helmet equivalent)
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
 
-  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+  // CORS — allow only configured origins (never wildcard on auth-protected server)
+  const isAllowed = ALLOWED_ORIGINS.includes(origin);
+  if (origin && isAllowed) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-TaurusMQ-CSRF, X-Requested-With');
+  }
+
+  if (req.method === 'OPTIONS') {
+    if (origin && isAllowed) {
+      res.writeHead(204);
+    } else {
+      res.writeHead(400);
+    }
+    res.end();
+    return;
+  }
 
   const url  = new URL(req.url, `http://localhost`);
   const path = url.pathname;
@@ -169,7 +183,6 @@ const server = http.createServer(async (req, res) => {
         port: redis.options.port || 6379,
         status,
         latency: latencyStr,
-        secretKey: 'tmq_sec_9F8H2S820DKS910398FJS82',
         ...config
       });
     }
@@ -287,6 +300,8 @@ const server = http.createServer(async (req, res) => {
             processedOn: p.processedOn || null,
             finishedOn: p.finishedOn || null,
             duration: p.duration || null,
+            progress: p.progress ?? null,
+            returnvalue: p.returnvalue ?? null,
             stacktrace: p.stacktrace || (p.stack ? p.stack.split('\n') : []),
             timeline: p.timeline || [],
             snapshot: p.snapshot || null,
@@ -407,14 +422,9 @@ const server = http.createServer(async (req, res) => {
     const cleanMatch = path.match(/^\/api\/queues\/([^/]+)\/actions\/clean$/);
     if (req.method === 'POST' && cleanMatch) {
       const name = decodeURIComponent(cleanMatch[1]);
-      await redis.del(`taurusmq:${name}`);
-      await redis.del(`taurusmq:signal:${name}`);
-      await redis.del(`taurusmq:delayed:${name}`);
-      await redis.del(`taurusmq:active:${name}`);
-      await redis.del(`taurusmq:dlq:${name}`);
-      await redis.del(`taurusmq:blocked:${name}`);
-      await redis.del(`taurusmq:jobs:${name}`);
-      await redis.del(`taurusmq:paused:${name}`);
+      const Queue = require('../../src/core/queue');
+      const q = new Queue(name);
+      await q.obliterate();
       await redis.del(`tmq:obs:paused-retries:${name}`);
       return json(res, { ok: true });
     }
@@ -497,11 +507,11 @@ function setupPubSubBridge() {
 async function discoverQueues() {
   const [obsKeys, jobsKeys] = await Promise.all([
     redis.keys('tmq:obs:materialized:*'),
-    redis.keys('taurusmq:jobs:*')
+    redis.keys('*:jobs:*')
   ]);
   const set = new Set([
     ...(obsKeys ?? []).map(k => k.replace('tmq:obs:materialized:', '')),
-    ...(jobsKeys ?? []).map(k => k.replace('taurusmq:jobs:', ''))
+    ...(jobsKeys ?? []).map(k => k.split(':jobs:')[1])
   ]);
   return Array.from(set);
 }
@@ -600,7 +610,7 @@ let _eventWriter;
  */
 async function startObservabilityStack(queueNames = [], setup, jwtSecret, port = 4000) {
   // Wire auth
-  _auth = createAuth(setup, jwtSecret);
+  _auth = createAuth(setup, jwtSecret, ALLOWED_ORIGINS);
 
   // Wire engines
   const collector  = new MetricsCollector(bus);
