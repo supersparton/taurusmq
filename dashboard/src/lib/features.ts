@@ -9,14 +9,14 @@ export const FEATURES = {
   // Phase 2: Debugger (Execution timeline, in-UI logs, stack traces, replay, failure groups) - ENABLED
   PHASE_2_DEBUGGER: true,
 
-  // Phase 3: Incident Center (Playbook recommendations, firing incidents, alerts history) - DISABLED
-  PHASE_3_INCIDENT_CENTER: false,
+  // Phase 3: Incident Center (Playbook recommendations, firing incidents, alerts history) - ENABLED
+  PHASE_3_INCIDENT_CENTER: true,
 
-  // Phase 4: Analytics (Capacity forecasting, Net growth rates, Cost / FinOps tracking) - DISABLED
-  PHASE_4_ANALYTICS: false,
+  // Phase 4: Analytics (Capacity forecasting, Net growth rates) - ENABLED
+  PHASE_4_ANALYTICS: true,
 
-  // Phase 5: Flow Visualization (Visual parent-child DAG map) - DISABLED
-  PHASE_5_FLOW_VISUALIZATION: false,
+  // Phase 5: Flow Visualization (Visual parent-child DAG map) - ENABLED
+  PHASE_5_FLOW_VISUALIZATION: true,
 };
 
 /**

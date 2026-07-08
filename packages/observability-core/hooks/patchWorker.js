@@ -225,6 +225,7 @@ function patchWorker(WorkerClass, bus, options = {}) {
             jobName:   j.name,
             workerId:  this._workerId,
             durationMs,
+            waitingDurationMs: startMs - (j.timestamp ?? startMs),
             attempt:   j.attempts ?? 1,
             result,  // actual return value, not null
           });
@@ -278,6 +279,7 @@ function patchWorker(WorkerClass, bus, options = {}) {
             jobName:      j.name,
             workerId:     this._workerId,
             durationMs,
+            waitingDurationMs: startMs - (j.timestamp ?? startMs),
             attempt:      j.attempts ?? 1,
             failedReason: err.message,
             stack:        err.stack ?? null,

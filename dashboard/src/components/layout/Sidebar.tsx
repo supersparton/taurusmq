@@ -8,10 +8,18 @@ import {
 } from 'lucide-react';
 import { healthColor } from '@/lib/utils';
 import { isFeatureEnabled } from '@/lib/features';
-import { getQueues } from '@/lib/api';
+import { getQueues, getIncidents } from '@/lib/api';
 import { useState, useEffect } from 'react';
 
-const NAV = [
+interface NavItem {
+  href: string;
+  icon: any;
+  label: string;
+  feature: string;
+  badge?: string | number;
+}
+
+const NAV: NavItem[] = [
   { href: '/',          icon: LayoutDashboard, label: 'Overview',           feature: 'PHASE_1_MVP' },
   { href: '/queues',    icon: Layers,          label: 'Queues',             feature: 'PHASE_1_MVP' },
   { href: '/jobs',      icon: Search,          label: 'Job Inspector',      feature: 'PHASE_1_MVP' },
@@ -19,27 +27,24 @@ const NAV = [
   { href: '/settings',  icon: Settings,        label: 'Settings',           feature: 'PHASE_1_MVP' },
   { href: '/flow',      icon: GitFork,         label: 'Flow',               feature: 'PHASE_5_FLOW_VISUALIZATION' },
   { href: '/analytics', icon: BarChart3,       label: 'Analytics',          feature: 'PHASE_4_ANALYTICS' },
-  { href: '/alerts',    icon: Bell,            label: 'Alerts',  badge: 5,  feature: 'PHASE_3_INCIDENT_CENTER' },
+  { href: '/alerts',    icon: Bell,            label: 'Alerts',             feature: 'PHASE_3_INCIDENT_CENTER' },
   { href: '/stream',    icon: Activity,        label: 'Event Stream',       feature: 'PHASE_2_DEBUGGER' },
-];
-
-const INTEL_NAV = [
-  { href: '/intelligence/incident', icon: FileWarning, label: 'Incident Analysis', badge: '🔴', feature: 'PHASE_3_INCIDENT_CENTER' },
-  { href: '/intelligence/actions',  icon: ListChecks,  label: 'Triage Playbook',  badge: '5',  feature: 'PHASE_3_INCIDENT_CENTER' },
-  { href: '/intelligence/cost',     icon: DollarSign,  label: 'Cost Analytics',                feature: 'PHASE_4_ANALYTICS' },
 ];
 
 export default function Sidebar() {
   const path = usePathname();
   const isIncidentsEnabled = isFeatureEnabled('PHASE_3_INCIDENT_CENTER');
-  const firingCount = isIncidentsEnabled ? 5 : 0;
+  const [firingCount, setFiringCount] = useState(0);
   const [queues, setQueues] = useState<any[]>([]);
 
   useEffect(() => {
     let active = true;
     async function load() {
       try {
-        const raw = await getQueues();
+        const [raw, incidentsRaw] = await Promise.all([
+          getQueues(),
+          isIncidentsEnabled ? getIncidents().catch(() => ({ firing: [] })) : Promise.resolve({ firing: [] })
+        ]);
         if (active && raw) {
           setQueues(raw.map((q: any) => ({
             name: q.name,
@@ -52,8 +57,14 @@ export default function Sidebar() {
         } else if (active) {
           setQueues([]);
         }
+        if (active && incidentsRaw) {
+          setFiringCount(incidentsRaw.firing.length);
+        }
       } catch (err) {
-        if (active) setQueues([]);
+        if (active) {
+          setQueues([]);
+          setFiringCount(0);
+        }
       }
     }
     load();
@@ -62,7 +73,7 @@ export default function Sidebar() {
       active = false;
       clearInterval(interval);
     };
-  }, []);
+  }, [isIncidentsEnabled]);
 
   return (
     <aside style={{
@@ -151,12 +162,14 @@ export default function Sidebar() {
             );
           }
 
+          const finalBadge = label === 'Alerts' ? (firingCount > 0 ? firingCount : undefined) : badge;
+
           return (
             <Link key={href} href={href} className={`nav-item ${path === href ? 'active' : ''}`}
-              style={{ marginBottom: 1 }}>
+               style={{ marginBottom: 1 }}>
               <Icon size={14} />
               <span style={{ flex: 1 }}>{label}</span>
-              {badge && (
+              {finalBadge && (
                 <span style={{
                   background: '#ef4444',
                   color: '#fff',
@@ -166,38 +179,13 @@ export default function Sidebar() {
                   borderRadius: 10,
                   minWidth: 18,
                   textAlign: 'center',
-                }}>{badge}</span>
+                }}>{finalBadge}</span>
               )}
             </Link>
           );
         })}
 
-        {/* Intelligence sub-nav */}
-        {isIncidentsEnabled && (
-          <div style={{ marginTop: 12, marginBottom: 4 }}>
-            <div style={{ fontSize: 10, fontWeight: 600, letterSpacing: '0.1em', color: 'var(--text-dim)', padding: '4px 6px', textTransform: 'uppercase' }}>
-              Intelligence
-            </div>
-            {INTEL_NAV.map(({ href, icon: Icon, label, badge, feature }) => {
-              const enabled = isFeatureEnabled(feature as any);
-              if (!enabled) return null;
 
-              return (
-                <Link key={href} href={href} className={`nav-item ${path === href ? 'active' : ''}`}
-                  style={{ marginBottom: 1, paddingLeft: 10 }}>
-                  <Icon size={13} />
-                  <span style={{ flex: 1, fontSize: 12 }}>{label}</span>
-                  {badge && badge === '🔴' && <span style={{ fontSize: 10 }}>🔴</span>}
-                  {badge && badge !== '🔴' && (
-                    <span style={{ background: '#f97316', color: '#fff', fontSize: 10, fontWeight: 700, padding: '1px 5px', borderRadius: 10, minWidth: 18, textAlign: 'center' }}>
-                      {badge}
-                    </span>
-                  )}
-                </Link>
-              );
-            })}
-          </div>
-        )}
 
         {/* Queue list */}
         <div style={{ marginTop: 16, marginBottom: 6 }}>

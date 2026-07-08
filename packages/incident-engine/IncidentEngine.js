@@ -48,11 +48,11 @@ class IncidentEngine {
   }
 
   start() {
-    this._timer = setInterval(() => this._evalAll(), EVAL_INTERVAL_MS);
-    console.log('[obs] IncidentEngine started, evaluating every', EVAL_INTERVAL_MS / 1000, 's');
+    // Disabled old periodic evaluation loop. Alert evaluation is now push-based in MetricsAggregator.
+    console.log('[obs] IncidentEngine (dynamic alerts view) active');
   }
 
-  stop() { clearInterval(this._timer); }
+  stop() {}
 
   addQueue(q) { if (!this.queueNames.includes(q)) this.queueNames.push(q); }
 

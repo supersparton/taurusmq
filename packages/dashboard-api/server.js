@@ -30,7 +30,6 @@ const redis              = require('../../src/utils/redis');
 
 const { MetricsAggregator }    = require('../metrics-engine/MetricsAggregator');
 const { MetricsCollector }     = require('../metrics-engine/MetricsCollector');
-const { CostAnalyticsEngine }  = require('../metrics-engine/CostAnalyticsEngine');
 const { IncidentEngine }       = require('../incident-engine/IncidentEngine');
 const { RecommendationEngine } = require('../recommendation-engine/RecommendationEngine');
 const { ForecastingEngine }    = require('../forecasting-engine/ForecastingEngine');
@@ -158,6 +157,63 @@ const server = http.createServer(async (req, res) => {
       return json(res, await _recommendations.generate(firing));
     }
 
+    // ── GET /api/alerts/rules ─────────────────────────────────────────────
+    if (req.method === 'GET' && path === '/api/alerts/rules') {
+      const raw = await redis.hgetall('taurusmq:obs:alert_rules') ?? {};
+      const rules = Object.values(raw).map(v => {
+        try { return JSON.parse(v); } catch (_) { return null; }
+      }).filter(Boolean);
+      return json(res, rules);
+    }
+
+    // ── POST /api/alerts/rules ────────────────────────────────────────────
+    if (req.method === 'POST' && path === '/api/alerts/rules') {
+      let bodyData = {};
+      try {
+        const buffers = [];
+        for await (const chunk of req) {
+          buffers.push(chunk);
+        }
+        const data = Buffer.concat(buffers).toString();
+        if (data) {
+          bodyData = JSON.parse(data);
+        }
+      } catch (_) {
+        res.writeHead(400);
+        return res.end(JSON.stringify({ error: 'Invalid JSON body' }));
+      }
+
+      const { queue, metric, threshold, windowMs, webhook, severity, name } = bodyData;
+      if (!queue || !metric || threshold === undefined) {
+        res.writeHead(400);
+        return res.end(JSON.stringify({ error: 'Missing required fields: queue, metric, threshold' }));
+      }
+
+      const ruleId = bodyData.id || `rule_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+      const rule = {
+        id: ruleId,
+        name: name || `${metric} alert on ${queue}`,
+        queue,
+        metric,
+        threshold: parseFloat(threshold),
+        windowMs: parseInt(windowMs || '60000', 10),
+        webhook: webhook || '',
+        severity: severity || 'critical',
+      };
+
+      await redis.hset('taurusmq:obs:alert_rules', ruleId, JSON.stringify(rule));
+      return json(res, { ok: true, rule });
+    }
+
+    // ── DELETE /api/alerts/rules/:id ───────────────────────────────────────
+    const ruleDeleteMatch = path.match(/^\/api\/alerts\/rules\/([^/]+)$/);
+    if (req.method === 'DELETE' && ruleDeleteMatch) {
+      const ruleId = decodeURIComponent(ruleDeleteMatch[1]);
+      await redis.hdel('taurusmq:obs:alert_rules', ruleId);
+      await redis.hdel('tmq:obs:alerts', ruleId);
+      return json(res, { ok: true });
+    }
+
     // ── GET /api/settings ─────────────────────────────────────────────────
     if (req.method === 'GET' && path === '/api/settings') {
       const startMs = Date.now();
@@ -216,10 +272,49 @@ const server = http.createServer(async (req, res) => {
       return json(res, await _forecasting.forecastAll(names));
     }
 
-    // ── GET /api/cost ─────────────────────────────────────────────────────
-    if (req.method === 'GET' && path === '/api/cost') {
-      const names = await discoverQueues();
-      return json(res, await Promise.all(names.map(n => _cost.getCostSummary(n))));
+    // ── GET /api/queues/:name/analytics ──────────────────────────────────
+    const analyticsMatch = path.match(/^\/api\/queues\/([^/]+)\/analytics$/);
+    if (req.method === 'GET' && analyticsMatch) {
+      const name = decodeURIComponent(analyticsMatch[1]);
+      const range = url.searchParams.get('range') || '24h';
+      
+      const hoursCount = range === '7d' ? 168 : 24;
+      const now = new Date();
+      const buckets = [];
+      for (let i = hoursCount - 1; i >= 0; i--) {
+        const d = new Date(now.getTime() - i * 60 * 60 * 1000);
+        const yyyymmdd = d.toISOString().slice(0, 10);
+        const hh = String(d.getUTCHours()).padStart(2, '0');
+        const hourKey = `taurusmq:obs:metrics:${name}:${yyyymmdd}:hour-${hh}`;
+        buckets.push({
+          timestamp: d.toISOString(),
+          key: hourKey,
+        });
+      }
+
+      const pipe = redis.pipeline();
+      for (const b of buckets) {
+        pipe.hgetall(b.key);
+      }
+      const results = await pipe.exec();
+
+      const data = buckets.map((b, idx) => {
+        const hash = results[idx][1] || {};
+        const processed = parseInt(hash.processed ?? '0', 10);
+        const failed = parseInt(hash.failed ?? '0', 10);
+        const totalDuration = parseFloat(hash.total_duration ?? '0');
+        const totalWait = parseFloat(hash.total_wait ?? '0');
+
+        return {
+          timestamp: b.timestamp,
+          processed,
+          failed,
+          avgLatencyMs: processed + failed > 0 ? Number((totalDuration / (processed + failed)).toFixed(2)) : 0,
+          avgWaitMs: processed + failed > 0 ? Number((totalWait / (processed + failed)).toFixed(2)) : 0,
+        };
+      });
+
+      return json(res, data);
     }
 
     // ── GET /api/events ───────────────────────────────────────────────────
@@ -228,6 +323,226 @@ const server = http.createServer(async (req, res) => {
       const to     = parseInt(url.searchParams.get('to')   ?? String(Date.now()), 10);
       const count  = parseInt(url.searchParams.get('count') ?? '200', 10);
       return json(res, await _eventWriter.readRange(from, to, count));
+    }
+
+    // ── GET /api/analytics ────────────────────────────────────────────────
+    if (req.method === 'GET' && path === '/api/analytics') {
+      const names = await discoverQueues();
+      const allHistories = [];
+      
+      for (const name of names) {
+        const rawHistory = await redis.lrange(`tmq:obs:metrics:${name}:history`, 0, -1) ?? [];
+        const history = rawHistory.map(h => {
+          try { return JSON.parse(h); } catch { return null; }
+        }).filter(Boolean);
+        allHistories.push(history);
+      }
+
+      const timeBuckets = {};
+
+      for (const history of allHistories) {
+        for (const pt of history) {
+          const ts = pt.updatedAt || Date.now();
+          const bucketKey = Math.floor(ts / 10000) * 10000;
+          
+          if (!timeBuckets[bucketKey]) {
+            timeBuckets[bucketKey] = {
+              t: bucketKey,
+              throughput: 0,
+              waiting: 0,
+              failed: 0,
+              completed: 0,
+              totalLatency: 0,
+              latencyCount: 0,
+              p50: 0,
+              p95: 0,
+              p99: 0,
+              errorSum: 0,
+              errorCount: 0,
+              retrySum: 0,
+              retryCount: 0
+            };
+          }
+          
+          const b = timeBuckets[bucketKey];
+          b.throughput += pt.throughput || 0;
+          b.waiting += pt.waiting || 0;
+          b.failed += pt.failed || 0;
+          b.completed += pt.completed || 0;
+          
+          if (pt.avgLatencyMs) {
+            b.totalLatency += pt.avgLatencyMs;
+            b.latencyCount++;
+          }
+          if (pt.p50LatencyMs) b.p50 = Math.max(b.p50, pt.p50LatencyMs);
+          if (pt.p95LatencyMs) b.p95 = Math.max(b.p95, pt.p95LatencyMs);
+          if (pt.p99LatencyMs) b.p99 = Math.max(b.p99, pt.p99LatencyMs);
+          
+          if (pt.errorRate !== undefined) {
+            b.errorSum += pt.errorRate;
+            b.errorCount++;
+          }
+          if (pt.retryRate !== undefined) {
+            b.retrySum += pt.retryRate;
+            b.retryCount++;
+          }
+        }
+      }
+
+      const sortedBuckets = Object.values(timeBuckets)
+        .sort((a, b) => a.t - b.t)
+        .map(b => {
+          const avgLatency = b.latencyCount > 0 ? Number((b.totalLatency / b.latencyCount).toFixed(0)) : 0;
+          const avgError = b.errorCount > 0 ? Number((b.errorSum / b.errorCount).toFixed(1)) : 0;
+          const avgRetry = b.retryCount > 0 ? Number((b.retrySum / b.retryCount).toFixed(1)) : 0;
+          
+          return {
+            t: b.t,
+            throughput: Number(b.throughput.toFixed(1)),
+            waiting: b.waiting,
+            avgLatency,
+            p50: b.p50 || avgLatency,
+            p95: b.p95 || avgLatency,
+            p99: b.p99 || avgLatency,
+            errorRate: avgError,
+            retryRate: avgRetry,
+            successRate: Number((100 - avgError).toFixed(1))
+          };
+        });
+
+      return json(res, sortedBuckets);
+    }
+
+    // ── GET /api/flows ─────────────────────────────────────────────────────
+    if (req.method === 'GET' && path === '/api/flows') {
+      const names = await discoverQueues();
+      const flowJobs = [];
+      for (const name of names) {
+        const raw = await redis.hgetall(`taurusmq:jobs:${name}`) || {};
+        for (const [id, jobStr] of Object.entries(raw)) {
+          try {
+            const p = JSON.parse(jobStr);
+            const hasParent = p.parent && p.parent.length > 0;
+            if (hasParent || p.flow) {
+              flowJobs.push({
+                id: p.id,
+                name: p.name || 'default',
+                queueName: name,
+                state: p.status === 'dead' ? 'failed' : p.status,
+                timestamp: p.timestamp ?? Date.now(),
+                childrenCount: p.parent ? p.parent.length : 0
+              });
+            }
+          } catch (_) {}
+        }
+      }
+      flowJobs.sort((a, b) => b.timestamp - a.timestamp);
+      return json(res, flowJobs.slice(0, 50));
+    }
+
+    // ── GET /api/flows/:id ──────────────────────────────────────────────────
+    const flowMatch = path.match(/^\/api\/flows\/([^/]+)$/);
+    if (req.method === 'GET' && flowMatch) {
+      const id = decodeURIComponent(flowMatch[1]);
+      
+      const names = await discoverQueues();
+      let nodeJob = null;
+      for (const name of names) {
+        const rawJson = await redis.hget(`taurusmq:jobs:${name}`, id);
+        if (rawJson) {
+          try {
+            const p = JSON.parse(rawJson);
+            nodeJob = {
+              id: p.id,
+              name: p.name || 'default',
+              queueName: name,
+              state: p.status === 'dead' ? 'failed' : p.status,
+              attempts: p.attempts ?? 0,
+              maxAttempts: p.maxretries ?? 3,
+              timestamp: p.timestamp ?? Date.now(),
+              data: p.data || {},
+              parent: p.parent || []
+            };
+            break;
+          } catch (_) {}
+        }
+      }
+
+      if (!nodeJob) {
+        res.writeHead(404);
+        return res.end(JSON.stringify({ error: 'Job not found' }));
+      }
+
+      // Combine direct parent set + reverse job scan parent mappings
+      const parentSet = await redis.smembers(`taurusmq:dependent:${id}:children:`) || [];
+      const parentIds = [...parentSet];
+      if (parentIds.length === 0) {
+        for (const name of names) {
+          const raw = await redis.hgetall(`taurusmq:jobs:${name}`) || {};
+          for (const [pId, jobStr] of Object.entries(raw)) {
+            try {
+              const p = JSON.parse(jobStr);
+              if (p.parent && p.parent.includes(id)) {
+                parentIds.push(pId);
+              }
+            } catch (_) {}
+          }
+        }
+      }
+      const uniqueParentIds = Array.from(new Set(parentIds));
+
+      // Combine direct child set + parent's static children definitions
+      const childrenSet = await redis.smembers(`taurusmq:dependent:${id}:parent:`) || [];
+      const childrenArr = nodeJob.parent || [];
+      const uniqueChildrenIds = Array.from(new Set([...childrenSet, ...childrenArr]));
+
+      const parents = [];
+      for (const pId of uniqueParentIds) {
+        let pJob = null;
+        for (const name of names) {
+          const raw = await redis.hget(`taurusmq:jobs:${name}`, pId);
+          if (raw) {
+            try {
+              const p = JSON.parse(raw);
+              pJob = {
+                id: p.id,
+                name: p.name || 'default',
+                queueName: name,
+                state: p.status === 'dead' ? 'failed' : p.status
+              };
+              break;
+            } catch (_) {}
+          }
+        }
+        parents.push(pJob || { id: pId, name: 'Parent Job', queueName: 'unknown', state: 'unknown' });
+      }
+
+      const children = [];
+      for (const cId of uniqueChildrenIds) {
+        let cJob = null;
+        for (const name of names) {
+          const raw = await redis.hget(`taurusmq:jobs:${name}`, cId);
+          if (raw) {
+            try {
+              const p = JSON.parse(raw);
+              cJob = {
+                id: p.id,
+                name: p.name || 'default',
+                queueName: name,
+                state: p.status === 'dead' ? 'failed' : p.status
+              };
+              break;
+            } catch (_) {}
+          }
+        }
+        children.push(cJob || { id: cId, name: 'Child Job', queueName: 'unknown', state: 'unknown' });
+      }
+
+      return json(res, {
+        node: nodeJob,
+        parents,
+        children
+      });
     }
 
     // ── POST /api/queues/:name/actions/pause-retries ──────────────────────
@@ -599,7 +914,6 @@ function json(res, data) {
 let _incidents;
 let _recommendations;
 let _forecasting;
-let _cost;
 let _eventWriter;
 
 /**
@@ -618,13 +932,11 @@ async function startObservabilityStack(queueNames = [], setup, jwtSecret, port =
   _incidents       = new IncidentEngine(queueNames, bus);
   _recommendations = new RecommendationEngine();
   _forecasting     = new ForecastingEngine();
-  _cost            = new CostAnalyticsEngine();
   _eventWriter     = new EventStreamWriter();
 
   collector.start();
   aggregator.start();
   _incidents.start();
-  _cost.start();
   _eventWriter.start();
 
   setupPubSubBridge();

@@ -502,7 +502,9 @@ class Worker extends EventEmitter {
                     this.emit('drained');
                 }
             } catch (err) {
-                this.emit('error', err);
+                if (this.active) {
+                    this.emit('error', err);
+                }
             }
         }
     }

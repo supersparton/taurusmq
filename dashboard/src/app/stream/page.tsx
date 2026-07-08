@@ -60,6 +60,10 @@ export default function StreamPage() {
   const bottomRef = useRef<HTMLDivElement>(null);
   const events = useEventStream(paused);
 
+  // Pagination states
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize, setPageSize] = useState(50);
+
   const filtered = filter
     ? events.filter(e => {
         const msg = (e.message || '').toLowerCase();
@@ -69,6 +73,18 @@ export default function StreamPage() {
         return msg.includes(term) || qName.includes(term) || jId.includes(term);
       })
     : events;
+
+  // Reset page when filter changes
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [filter]);
+
+  // Compute pagination parameters
+  const totalItems = filtered.length;
+  const totalPages = Math.ceil(totalItems / pageSize) || 1;
+  const startIndex = (currentPage - 1) * pageSize;
+  const endIndex = Math.min(startIndex + pageSize, totalItems);
+  const paginatedEvents = filtered.slice(startIndex, endIndex);
 
   if (!enabled) {
     return (
@@ -83,7 +99,6 @@ export default function StreamPage() {
     <>
       <Topbar title="Real-Time Event Stream" subtitle="Live job lifecycle events" />
       <div className="page-content" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-
 
         {/* Controls bar */}
         <div style={{
@@ -113,9 +128,58 @@ export default function StreamPage() {
             />
           </div>
 
-          <span style={{ fontSize: 11, color: 'var(--text-muted)', fontVariantNumeric: 'tabular-nums' }}>
-            {filtered.length} events
-          </span>
+          {/* Pagination Controls */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+            <button
+              disabled={currentPage === 1}
+              onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+              className="btn btn-ghost"
+              style={{
+                padding: '3px 8px',
+                fontSize: 10.5,
+                opacity: currentPage === 1 ? 0.4 : 1,
+                cursor: currentPage === 1 ? 'not-allowed' : 'pointer',
+              }}
+            >
+              Prev
+            </button>
+            <span style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
+              {currentPage}/{totalPages} ({totalItems} total)
+            </span>
+            <button
+              disabled={currentPage === totalPages}
+              onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+              className="btn btn-ghost"
+              style={{
+                padding: '3px 8px',
+                fontSize: 10.5,
+                opacity: currentPage === totalPages ? 0.4 : 1,
+                cursor: currentPage === totalPages ? 'not-allowed' : 'pointer',
+              }}
+            >
+              Next
+            </button>
+            <select
+              value={pageSize}
+              onChange={e => {
+                setPageSize(Number(e.target.value));
+                setCurrentPage(1);
+              }}
+              style={{
+                background: 'var(--bg-base)',
+                border: '1px solid var(--border)',
+                borderRadius: 3,
+                color: 'var(--text-primary)',
+                padding: '2px 4px',
+                fontSize: 10.5,
+                outline: 'none',
+              }}
+            >
+              {[25, 50, 100, 200].map(sz => (
+                <option key={sz} value={sz}>{sz}/p</option>
+              ))}
+            </select>
+          </div>
 
           <button className="btn btn-ghost" style={{ fontSize: 11 }}>
             <Download size={11} /> Export
@@ -128,7 +192,7 @@ export default function StreamPage() {
           borderTop: '1px solid var(--border)',
           overflowY: 'auto', padding: '8px 0',
         }}>
-          {filtered.map((ev, i) => {
+          {paginatedEvents.map((ev, i) => {
             const color = eventTypeColor(ev.type);
             const isAlert = ev.type === 'alert_fired';
             return (

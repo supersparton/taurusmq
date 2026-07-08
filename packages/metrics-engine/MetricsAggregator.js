@@ -156,6 +156,131 @@ class MetricsAggregator {
     const histKey = `tmq:obs:metrics:${queue}:history`;
     await redis.rpush(histKey, historyItem);
     await redis.ltrim(histKey, -60, -1);
+
+    // ── 11. Redesigned Alerts Threshold Evaluation (Push-Based) ───────
+    try {
+      const rulesRaw = await redis.hgetall('taurusmq:obs:alert_rules') ?? {};
+      const activeIncidents = await redis.hgetall('tmq:obs:alerts') ?? {};
+
+      for (const [ruleId, ruleJson] of Object.entries(rulesRaw)) {
+        let rule;
+        try {
+          rule = JSON.parse(ruleJson);
+        } catch (_) {
+          continue;
+        }
+
+        if (rule.queue !== queue) {
+          continue;
+        }
+
+        // Evaluate metric value
+        let currentVal = 0;
+        let metricLabel = '';
+        let isViolation = false;
+
+        switch (rule.metric) {
+          case 'waiting':
+            currentVal = waiting;
+            metricLabel = 'waiting jobs';
+            isViolation = waiting > rule.threshold;
+            break;
+          case 'active':
+            currentVal = active;
+            metricLabel = 'active jobs';
+            isViolation = active > rule.threshold;
+            break;
+          case 'failed':
+            currentVal = failed;
+            metricLabel = 'failed jobs';
+            isViolation = failed > rule.threshold;
+            break;
+          case 'error_rate':
+          case 'failure_rate':
+            currentVal = Math.round(errorRate * 10000) / 100; // in %
+            metricLabel = 'failure rate';
+            isViolation = currentVal > rule.threshold;
+            break;
+          case 'avg_latency_ms':
+          case 'latency':
+            currentVal = Math.round(avgLatencyMs);
+            metricLabel = 'average latency';
+            isViolation = currentVal > rule.threshold;
+            break;
+          case 'health_score':
+          case 'health':
+            currentVal = healthScore;
+            metricLabel = 'health score';
+            isViolation = healthScore < rule.threshold; // lower than threshold is bad
+            break;
+          default:
+            continue;
+        }
+
+        const mapKey = ruleId;
+        const wasFiring = !!activeIncidents[mapKey];
+
+        if (isViolation) {
+          const suffix = rule.metric.includes('rate') ? '%' : (rule.metric.includes('latency') ? 'ms' : '');
+          const description = `Queue "${queue}" ${metricLabel} of ${currentVal}${suffix} violated threshold of ${rule.threshold}${suffix}.`;
+
+          const incident = {
+            id: ruleId,
+            ruleId: ruleId,
+            ruleName: rule.name || `${rule.metric} alert`,
+            severity: rule.severity || 'critical',
+            scope: 'queue',
+            scopeTarget: queue,
+            state: 'firing',
+            firedAt: wasFiring ? JSON.parse(activeIncidents[mapKey]).firedAt : Date.now(),
+            resolvedAt: null,
+            evidence: [description],
+            labels: { queue, metric: rule.metric, threshold: String(rule.threshold), current: String(currentVal) },
+            consecutiveTicks: wasFiring ? (JSON.parse(activeIncidents[mapKey]).consecutiveTicks || 0) + 1 : 1,
+          };
+
+          // Save/Update incident in Redis
+          const jsonStr = JSON.stringify(incident);
+          await redis.pipeline()
+            .hset('tmq:obs:incidents', ruleId, jsonStr)
+            .hset('tmq:obs:alerts', ruleId, jsonStr)
+            .exec();
+
+          // If it just transitioned to firing, send webhook
+          if (!wasFiring) {
+            console.log(`[obs] ALERT FIRED: ${rule.name || rule.metric} on queue ${queue}`);
+            if (rule.webhook) {
+              await sendSlackNotification(rule.webhook, {
+                text: `🚨 *[TaurusMQ ALERT FIRED]* *${rule.name || rule.metric}* on queue *${queue}*\n> Severity: ${rule.severity || 'critical'}\n> Description: ${description}`
+              });
+            }
+          }
+        } else {
+          // If it was firing but now is normal, resolve it
+          if (wasFiring) {
+            const stored = JSON.parse(activeIncidents[mapKey]);
+            stored.state = 'resolved';
+            stored.resolvedAt = Date.now();
+            const jsonStr = JSON.stringify(stored);
+
+            await redis.pipeline()
+              .hset('tmq:obs:incidents', ruleId, jsonStr)
+              .hdel('tmq:obs:alerts', ruleId)
+              .exec();
+
+            console.log(`[obs] ALERT RESOLVED: ${rule.name || rule.metric} on queue ${queue}`);
+
+            if (rule.webhook) {
+              await sendSlackNotification(rule.webhook, {
+                text: `✅ *[TaurusMQ ALERT RESOLVED]* *${rule.name || rule.metric}* on queue *${queue}*\n> Was resolved at: ${new Date(stored.resolvedAt).toISOString()}`
+              });
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.error('[obs] Alert evaluation error for', queue, ':', err.message);
+    }
   }
 
   /**
@@ -189,6 +314,42 @@ class MetricsAggregator {
     score -= Math.min(20, netGrowthRate > 10 ? (netGrowthRate / 200) * 20 : 0);
     score -= Math.min(15, waiting > 1000 ? (waiting / 10_000) * 15 : 0);
     return Math.max(0, Math.round(score));
+  }
+}
+
+async function sendSlackNotification(url, payload) {
+  if (!url) return;
+  try {
+    if (typeof fetch === 'function') {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        console.error('[obs] Webhook response not OK:', response.status);
+      }
+    } else {
+      const parsedUrl = new URL(url);
+      const client = parsedUrl.protocol === 'https:' ? require('https') : require('http');
+      const dataStr = JSON.stringify(payload);
+      const req = client.request(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(dataStr),
+        },
+      }, (res) => {
+        res.resume();
+      });
+      req.on('error', (err) => {
+        console.error('[obs] Fallback webhook request error:', err.message);
+      });
+      req.write(dataStr);
+      req.end();
+    }
+  } catch (err) {
+    console.error('[obs] Failed to send slack alert notification:', err.message);
   }
 }
 

@@ -161,6 +161,26 @@ export const replayJob = (queueName: string, jobId: string, data?: any) =>
     body: JSON.stringify({ data }),
   });
 
+export interface AlertRule {
+  id: string;
+  name: string;
+  queue: string;
+  metric: string;
+  threshold: number;
+  windowMs: number;
+  webhook: string;
+  severity: string;
+}
+
+export const getAlertRules = () => apiFetch<AlertRule[]>('/api/alerts/rules');
+export const saveAlertRule = (rule: Partial<AlertRule>) => apiFetch<{ ok: boolean; rule: AlertRule }>('/api/alerts/rules', {
+  method: 'POST',
+  body: JSON.stringify(rule),
+});
+export const deleteAlertRule = (id: string) => apiFetch<{ ok: boolean }>(`/api/alerts/rules/${encodeURIComponent(id)}`, {
+  method: 'DELETE',
+});
+
 export interface SystemSettings {
   host: string;
   port: number;
@@ -180,3 +200,56 @@ export const saveSystemSettings = (settings: Partial<SystemSettings>) =>
     method: 'POST',
     body: JSON.stringify(settings),
   });
+
+export interface QueueAnalyticsPoint {
+  timestamp: string;
+  processed: number;
+  failed: number;
+  avgLatencyMs: number;
+  avgWaitMs: number;
+}
+
+export const getQueueAnalytics = (queueName: string, range: string = '24h') =>
+  apiFetch<QueueAnalyticsPoint[]>(`/api/queues/${encodeURIComponent(queueName)}/analytics?range=${encodeURIComponent(range)}`);
+
+export interface FlowJobSummary {
+  id: string;
+  name: string;
+  queueName: string;
+  state: string;
+  timestamp: number;
+  childrenCount: number;
+}
+
+export interface FlowNodeDetail {
+  node: {
+    id: string;
+    name: string;
+    queueName: string;
+    state: string;
+    attempts: number;
+    maxAttempts: number;
+    timestamp: number;
+    data: any;
+  };
+  parents: Array<{ id: string; name: string; queueName: string; state: string }>;
+  children: Array<{ id: string; name: string; queueName: string; state: string }>;
+}
+
+export const getFlowJobs = () => apiFetch<FlowJobSummary[]>('/api/flows');
+export const getJobFlow = (jobId: string) => apiFetch<FlowNodeDetail>(`/api/flows/${encodeURIComponent(jobId)}`);
+
+export interface GlobalAnalyticsPoint {
+  t: number;
+  throughput: number;
+  waiting: number;
+  avgLatency: number;
+  p50: number;
+  p95: number;
+  p99: number;
+  errorRate: number;
+  retryRate: number;
+  successRate: number;
+}
+
+export const getGlobalAnalytics = () => apiFetch<GlobalAnalyticsPoint[]>('/api/analytics');

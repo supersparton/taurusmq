@@ -3,7 +3,7 @@ import { use } from 'react';
 import Topbar from '@/components/layout/Topbar';
 import { QUEUE_RISKS, CAPACITY_FORECASTS, RECOMMENDED_ACTIONS, QUEUE_DEPS } from '@/lib/intelligence';
 import { fmtMs, fmtNum, fmtPercent, relativeTime, jobStateBadge, jobStateDotColor, healthScoreColor } from '@/lib/utils';
-import { AreaSeries } from '@/components/charts/ChartPrimitives';
+import { AreaSeries, MultiLine } from '@/components/charts/ChartPrimitives';
 import { Pause, Play, RefreshCw, Trash2, ArrowRight, AlertTriangle, Zap } from 'lucide-react';
 import Link from 'next/link';
 import type { JobState } from '@/lib/types';
@@ -36,7 +36,7 @@ function HealthRing({ score, size = 72 }: { score: number; size?: number }) {
 
 const STATE_TABS: JobState[] = ['active', 'waiting', 'delayed', 'failed', 'completed'];
 
-import { getQueue, getQueueJobs, retryFailedJobs, cleanQueue, pauseRetries, retryJob, getWorkers } from '@/lib/api';
+import { getQueue, getQueueJobs, retryFailedJobs, cleanQueue, pauseRetries, retryJob, getWorkers, getQueueAnalytics } from '@/lib/api';
 import { isFeatureEnabled } from '@/lib/features';
 
 export default function QueueDetailPage({ params }: { params: any }) {
@@ -48,14 +48,16 @@ export default function QueueDetailPage({ params }: { params: any }) {
   const [activeTab, setActiveTab] = useState<JobState>('active');
   const [selectedFailureGroup, setSelectedFailureGroup] = useState<string | null>(null);
   const [history, setHistory] = useState<any[]>([]);
+  const [analytics, setAnalytics] = useState<any[]>([]);
   const [actionMessage, setActionMessage] = useState('');
 
   const loadData = async () => {
     try {
-      const [queueData, rawJobs, rawWorkers] = await Promise.all([
+      const [queueData, rawJobs, rawWorkers, analyticsData] = await Promise.all([
         getQueue(name),
         getQueueJobs(name),
-        getWorkers()
+        getWorkers(),
+        getQueueAnalytics(name, '24h')
       ]);
       
       if (queueData) {
@@ -98,6 +100,9 @@ export default function QueueDetailPage({ params }: { params: any }) {
           memory: Math.round((w.memoryBytes ?? 0) / 1024 / 1024),
           memoryMax: 512,
         })));
+      }
+      if (analyticsData) {
+        setAnalytics(analyticsData);
       }
     } catch (err) {
       // quiet fallback
@@ -220,13 +225,29 @@ export default function QueueDetailPage({ params }: { params: any }) {
       })
     : queueJobs;
 
-  const liveThroughputSeries = history.length > 0 
-    ? history.map(pt => ({ t: pt.t, v: pt.throughput }))
-    : Array.from({ length: 30 }, (_, i) => ({ t: Date.now() - (30 - i) * 10000, v: q ? q.throughput : 0 }));
+  const hourlyThroughputData = analytics.length > 0
+    ? analytics.map(pt => ({
+        t: new Date(pt.timestamp).getTime(),
+        processed: pt.processed,
+        failed: pt.failed,
+      }))
+    : Array.from({ length: 24 }, (_, i) => ({
+        t: Date.now() - (24 - i) * 3600000,
+        processed: 0,
+        failed: 0,
+      }));
 
-  const liveLatencySeries = history.length > 0 
-    ? history.map(pt => ({ t: pt.t, v: pt.latency }))
-    : Array.from({ length: 30 }, (_, i) => ({ t: Date.now() - (30 - i) * 10000, v: q ? q.avgLatency : 0 }));
+  const hourlyLatencyWaitData = analytics.length > 0
+    ? analytics.map(pt => ({
+        t: new Date(pt.timestamp).getTime(),
+        latency: pt.avgLatencyMs,
+        wait: pt.avgWaitMs,
+      }))
+    : Array.from({ length: 24 }, (_, i) => ({
+        t: Date.now() - (24 - i) * 3600000,
+        latency: 0,
+        wait: 0,
+      }));
 
   const isIncidentsEnabled = isFeatureEnabled('PHASE_3_INCIDENT_CENTER');
   const isAnalyticsEnabled = isFeatureEnabled('PHASE_4_ANALYTICS');
@@ -385,20 +406,36 @@ export default function QueueDetailPage({ params }: { params: any }) {
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 340px', gap: 10, marginBottom: 8 }}>
           {/* Throughput Trend */}
           <div className="panel">
-            <div className="panel-header"><span className="panel-title">Throughput Trend</span></div>
+            <div className="panel-header"><span className="panel-title">Hourly Throughput (Last 24h)</span></div>
             <div style={{ padding: '6px 10px 4px' }}>
-              <AreaSeries data={liveThroughputSeries} color="#06b6d4" name="jobs/min" height={110} formatter={v => `${v.toFixed(0)}/min`} />
+              <MultiLine
+                data={hourlyThroughputData}
+                series={[
+                  { key: 'processed', color: '#10b981', name: 'Processed' },
+                  { key: 'failed', color: '#ef4444', name: 'Failed' },
+                ]}
+                height={110}
+                formatter={v => `${v} jobs`}
+              />
             </div>
           </div>
           
-          {/* Latency & Failure Trend */}
+          {/* Latency & Wait-Time Trend */}
           <div className="panel">
             <div className="panel-header">
-              <span className="panel-title">Latency & Failure Trend</span>
+              <span className="panel-title">Performance Trends (Last 24h)</span>
               {q.p99Latency > 10000 && <span style={{ fontSize: 10, color: '#ef4444' }}>⚠ SLA breach</span>}
             </div>
             <div style={{ padding: '6px 10px 4px' }}>
-              <AreaSeries data={liveLatencySeries} color="#ef4444" name="ms" height={110} formatter={fmtMs} threshold={2000} thresholdLabel="SLA 2s" />
+              <MultiLine
+                data={hourlyLatencyWaitData}
+                series={[
+                  { key: 'latency', color: '#f59e0b', name: 'Execution Latency' },
+                  { key: 'wait', color: '#8b5cf6', name: 'Queue Wait Time' },
+                ]}
+                height={110}
+                formatter={fmtMs}
+              />
             </div>
           </div>
 

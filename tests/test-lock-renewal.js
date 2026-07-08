@@ -44,7 +44,7 @@ async function runTests() {
     // Register lua commands on the connection so we can call recoverStalled directly
     const fs = require('fs');
     const path = require('path');
-    const recoverStalledLua = fs.readFileSync(path.join(__dirname, 'src', 'lua', 'recoverStalled.lua'), 'utf8');
+    const recoverStalledLua = fs.readFileSync(path.join(__dirname,'..', 'src', 'lua', 'recoverStalled.lua'), 'utf8');
     connection.defineCommand('recoverStalled', {
         numberOfKeys: 6,
         lua: recoverStalledLua

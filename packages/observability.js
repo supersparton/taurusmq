@@ -62,7 +62,7 @@ async function attachObservability({
   }
 
   // 3. Start API server with auth wired in
-  await startObservabilityStack(queues, setup, jwtSecret, port);
+  const stack = await startObservabilityStack(queues, setup, jwtSecret, port);
 
   console.log('[obs] ─────────────────────────────────────────');
   console.log(`[obs] TaurusMQ Observability running`);
@@ -70,6 +70,8 @@ async function attachObservability({
   console.log(`[obs] Login  → POST http://localhost:${port}/api/auth/login`);
   console.log(`[obs] User   → ${creds.username}`);
   console.log('[obs] ─────────────────────────────────────────');
+
+  return stack;
 }
 
 module.exports = { attachObservability, bus };

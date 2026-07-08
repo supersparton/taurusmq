@@ -85,9 +85,14 @@ class MetricsCollector {
     await pipe.exec();
   }
 
-  async _onJobCompleted({ queueName, durationMs }) {
+  async _onJobCompleted({ queueName, durationMs, waitingDurationMs }) {
     const minuteBucket = this._minuteBucket();
     const tpKey = `tmq:obs:tp:${queueName}:${minuteBucket}`;
+
+    const dateObj = new Date();
+    const yyyymmdd = dateObj.toISOString().slice(0, 10);
+    const hourStr = String(dateObj.getUTCHours()).padStart(2, '0');
+    const hourKey = `taurusmq:obs:metrics:${queueName}:${yyyymmdd}:hour-${hourStr}`;
 
     const pipe = redis.pipeline();
     // Counters
@@ -101,10 +106,22 @@ class MetricsCollector {
     // Latency ring buffer
     pipe.rpush(this._latencyKey(queueName), String(durationMs));
     pipe.ltrim(this._latencyKey(queueName), -LATENCY_RING_SIZE, -1);
+
+    // Roll-up analytics
+    pipe.hincrby(hourKey, 'processed', 1);
+    pipe.hincrbyfloat(hourKey, 'total_duration', durationMs || 0);
+    pipe.hincrbyfloat(hourKey, 'total_wait', waitingDurationMs || 0);
+    pipe.expire(hourKey, 604800); // 7 days TTL
+
     await pipe.exec();
   }
 
-  async _onJobFailed({ queueName, failedReason, willRetry }) {
+  async _onJobFailed({ queueName, failedReason, willRetry, durationMs, waitingDurationMs }) {
+    const dateObj = new Date();
+    const yyyymmdd = dateObj.toISOString().slice(0, 10);
+    const hourStr = String(dateObj.getUTCHours()).padStart(2, '0');
+    const hourKey = `taurusmq:obs:metrics:${queueName}:${yyyymmdd}:hour-${hourStr}`;
+
     const pipe = redis.pipeline();
     this._pipeDecr(pipe, this._ckey(queueName), 'active');
     if (willRetry) {
@@ -116,6 +133,13 @@ class MetricsCollector {
     // Error group — truncate reason to first 100 chars for grouping key
     const groupKey = (failedReason ?? 'unknown').slice(0, 100);
     pipe.hincrby(`tmq:obs:metrics:${queueName}:errors`, groupKey, 1);
+
+    // Roll-up analytics
+    pipe.hincrby(hourKey, 'failed', 1);
+    pipe.hincrbyfloat(hourKey, 'total_duration', durationMs || 0);
+    pipe.hincrbyfloat(hourKey, 'total_wait', waitingDurationMs || 0);
+    pipe.expire(hourKey, 604800); // 7 days TTL
+
     await pipe.exec();
   }
 
