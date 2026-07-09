@@ -1,7 +1,7 @@
 'use client';
 import { use } from 'react';
 import Topbar from '@/components/layout/Topbar';
-import { QUEUE_RISKS, CAPACITY_FORECASTS, RECOMMENDED_ACTIONS, QUEUE_DEPS } from '@/lib/intelligence';
+
 import { fmtMs, fmtNum, fmtPercent, relativeTime, jobStateBadge, jobStateDotColor, healthScoreColor } from '@/lib/utils';
 import { AreaSeries, MultiLine } from '@/components/charts/ChartPrimitives';
 import { Pause, Play, RefreshCw, Trash2, ArrowRight, AlertTriangle, Zap } from 'lucide-react';
@@ -36,7 +36,7 @@ function HealthRing({ score, size = 72 }: { score: number; size?: number }) {
 
 const STATE_TABS: JobState[] = ['active', 'waiting', 'delayed', 'failed', 'completed'];
 
-import { getQueue, getQueueJobs, retryFailedJobs, cleanQueue, pauseRetries, retryJob, getWorkers, getQueueAnalytics } from '@/lib/api';
+import { getQueue, getQueueJobs, retryFailedJobs, cleanQueue, pauseRetries, retryJob, getWorkers, getQueueAnalytics, getRecommendations, getIncidents, getQueueDependencies } from '@/lib/api';
 import { isFeatureEnabled } from '@/lib/features';
 
 export default function QueueDetailPage({ params }: { params: any }) {
@@ -51,13 +51,32 @@ export default function QueueDetailPage({ params }: { params: any }) {
   const [analytics, setAnalytics] = useState<any[]>([]);
   const [actionMessage, setActionMessage] = useState('');
 
-  const loadData = async () => {
+  // Interactive Timeframe and Polling Selectors
+  const [timeRange, setTimeRange] = useState('Last 24h');
+  const [refreshInterval, setRefreshInterval] = useState('5s');
+
+  // Real intelligence telemetry states
+  const [recommendations, setRecommendations] = useState<any[]>([]);
+  const [incidents, setIncidents] = useState<{ firing: any[]; history: any[] }>({ firing: [], history: [] });
+  const [dependencies, setDependencies] = useState<any[]>([]);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize, setPageSize] = useState(25);
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [activeTab, selectedFailureGroup]);
+
+  const loadData = async (currentRange = timeRange) => {
     try {
-      const [queueData, rawJobs, rawWorkers, analyticsData] = await Promise.all([
+      const apiRange = currentRange === 'Last 7d' ? '7d' : currentRange === 'Last 24h' ? '24h' : '1h';
+      const [queueData, rawJobs, rawWorkers, analyticsData, rawRecommendations, rawIncidents, rawDeps] = await Promise.all([
         getQueue(name),
         getQueueJobs(name),
         getWorkers(),
-        getQueueAnalytics(name, '24h')
+        getQueueAnalytics(name, apiRange),
+        getRecommendations().catch(() => []),
+        getIncidents().catch(() => ({ firing: [], history: [] })),
+        getQueueDependencies().catch(() => [])
       ]);
       
       if (queueData) {
@@ -79,6 +98,11 @@ export default function QueueDetailPage({ params }: { params: any }) {
           errorRate: queueData.errorRate ?? 0,
           retryRate: queueData.retryRate ?? 0,
           workerCount: queueData.workerCount ?? 0,
+          forecast: queueData.forecast ? {
+            ...queueData.forecast,
+            overflowWarningAt: queueData.forecast.overflowThreshold,
+            workersSuggestedToAdd: queueData.forecast.workersNeeded,
+          } : null,
         });
         if (queueData.history) {
           setHistory(queueData.history);
@@ -104,21 +128,43 @@ export default function QueueDetailPage({ params }: { params: any }) {
       if (analyticsData) {
         setAnalytics(analyticsData);
       }
+      if (rawRecommendations) {
+        setRecommendations(rawRecommendations);
+      }
+      if (rawIncidents) {
+        setIncidents(rawIncidents);
+      }
+      if (rawDeps && Array.isArray(rawDeps)) {
+        setDependencies(rawDeps);
+      } else {
+        setDependencies([]);
+      }
     } catch (err) {
       // quiet fallback
     }
   };
 
   useEffect(() => {
-    loadData();
-    const interval = setInterval(loadData, 4000);
+    loadData(timeRange);
+
+    if (refreshInterval === 'Off') return;
+
+    const ms = refreshInterval === '5s' ? 5000 : refreshInterval === '15s' ? 15000 : 30000;
+    const interval = setInterval(() => loadData(timeRange), ms);
     return () => clearInterval(interval);
-  }, [name]);
+  }, [name, timeRange, refreshInterval]);
 
   if (!q) {
     return (
       <>
-        <Topbar title={name} subtitle="Loading..." />
+        <Topbar
+          title={name}
+          subtitle="Loading..."
+          timeRange={timeRange}
+          onTimeRangeChange={setTimeRange}
+          refreshInterval={refreshInterval}
+          onRefreshIntervalChange={setRefreshInterval}
+        />
         <div className="page-content" style={{ padding: 48, textAlign: 'center' }}>
           <div style={{ color: 'var(--text-muted)', fontSize: 13, fontFamily: 'var(--font-mono)' }}>
             Fetching queue configuration and telemetry from Redis...
@@ -225,6 +271,10 @@ export default function QueueDetailPage({ params }: { params: any }) {
       })
     : queueJobs;
 
+  const totalJobsCount = displayedJobs.length;
+  const totalPages = Math.ceil(totalJobsCount / pageSize) || 1;
+  const paginatedJobs = displayedJobs.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+
   const hourlyThroughputData = analytics.length > 0
     ? analytics.map(pt => ({
         t: new Date(pt.timestamp).getTime(),
@@ -253,15 +303,50 @@ export default function QueueDetailPage({ params }: { params: any }) {
   const isAnalyticsEnabled = isFeatureEnabled('PHASE_4_ANALYTICS');
   const isFlowEnabled = isFeatureEnabled('PHASE_5_FLOW_VISUALIZATION');
 
-  const risk = isIncidentsEnabled ? QUEUE_RISKS.find(r => r.queueName === q.name) : null;
-  const forecast = isAnalyticsEnabled ? CAPACITY_FORECASTS.find(f => f.queueName === q.name) : null;
-  const actions = isIncidentsEnabled ? RECOMMENDED_ACTIONS.filter(a => a.queue === q.name).slice(0, 3) : [];
-  const upstreamDeps = isFlowEnabled ? QUEUE_DEPS.filter(d => d.to === q.name) : [];
-  const downstreamDeps = isFlowEnabled ? QUEUE_DEPS.filter(d => d.from === q.name) : [];
+  // Compute dynamic risk score based on active alerts and stalled workers
+  const queueIncidents = incidents.firing.filter((i: any) => i.scopeTarget === name);
+  const queueWorkers = workers.filter(w => w.queueName === name);
+  const stalledWorkersCount = queueWorkers.filter(w => w.state === 'stalled').length;
+
+  let dynamicRiskScore = 0;
+  if (stalledWorkersCount > 0) dynamicRiskScore += stalledWorkersCount * 25;
+  if (q.counts.waiting > 0 && q.throughput === 0) dynamicRiskScore += 40;
+  
+  queueIncidents.forEach((i: any) => {
+    dynamicRiskScore += i.severity === 'critical' ? 30 : 15;
+  });
+  
+  const riskScore = Math.min(100, dynamicRiskScore);
+  const riskLevel = riskScore >= 80 ? 'critical' : riskScore >= 50 ? 'high' : riskScore >= 20 ? 'medium' : 'low';
+  
+  const risk = riskScore > 0 ? {
+    queueName: name,
+    riskScore,
+    riskLevel,
+    timeToFailureMs: q.forecast?.timeToOverflowMs ?? undefined,
+    failureMode: queueIncidents.map((i: any) => i.ruleName).join(', ') || (stalledWorkersCount > 0 ? `${stalledWorkersCount} stalled worker(s)` : 'Degraded throughput'),
+    trend: riskScore >= 80 ? 'critical' : riskScore >= 50 ? 'degrading' : 'stable',
+    signals: [
+      ...(stalledWorkersCount > 0 ? [`${stalledWorkersCount} worker(s) stalled`] : []),
+      ...queueIncidents.map((i: any) => i.evidence?.[0] || i.ruleName),
+    ]
+  } : null;
+
+  const forecast = isAnalyticsEnabled ? q.forecast : null;
+  const depsArray = Array.isArray(dependencies) ? dependencies : [];
+  const upstreamDeps = isFlowEnabled ? depsArray.filter((d: any) => d.to === q.name) : [];
+  const downstreamDeps = isFlowEnabled ? depsArray.filter((d: any) => d.from === q.name) : [];
 
   return (
     <>
-      <Topbar title={q.name} subtitle={risk ? `queue · risk ${risk.riskScore}/100 · health ${q.healthScore}/100` : `queue · health ${q.healthScore}/100`} />
+      <Topbar
+        title={q.name}
+        subtitle={risk ? `queue · risk ${risk.riskScore}/100 · health ${q.healthScore}/100` : `queue · health ${q.healthScore}/100`}
+        timeRange={timeRange}
+        onTimeRangeChange={setTimeRange}
+        refreshInterval={refreshInterval}
+        onRefreshIntervalChange={setRefreshInterval}
+      />
       <div className="page-content" style={{ padding: 12 }}>
 
         {/* Action feedback banner */}
@@ -309,7 +394,7 @@ export default function QueueDetailPage({ params }: { params: any }) {
 
             {/* Risk Assessment */}
             {risk && (
-              <div className={`panel col-4 risk-card risk-${risk.riskLevel}`} style={{ padding: 0 }}>
+              <div className={`panel ${forecast ? 'col-6' : 'col-12'} risk-card risk-${risk.riskLevel}`} style={{ padding: 0 }}>
                 <div className="panel-header">
                   <span className="panel-title">Risk Assessment</span>
                   <span style={{ fontSize: 12, fontWeight: 800, color: risk.riskLevel === 'critical' ? '#ef4444' : risk.riskLevel === 'high' ? '#f97316' : '#f59e0b' }}>
@@ -338,7 +423,7 @@ export default function QueueDetailPage({ params }: { params: any }) {
 
             {/* Capacity Forecast */}
             {forecast && (
-              <div className="panel col-4">
+              <div className={`panel ${risk ? 'col-6' : 'col-12'}`}>
                 <div className="panel-header">
                   <span className="panel-title">Capacity Forecast</span>
                   {forecast.timeToOverflowMs && <span style={{ fontSize: 10, color: '#ef4444' }}>Overflow imminent</span>}
@@ -377,28 +462,6 @@ export default function QueueDetailPage({ params }: { params: any }) {
                 </div>
               </div>
             )}
-
-            {/* Recommended Actions */}
-            {isIncidentsEnabled && (
-              <div className="panel col-4">
-                <div className="panel-header">
-                  <span className="panel-title">Recommended Actions</span>
-                  <Link href="/intelligence/actions" style={{ fontSize: 10, color: 'var(--accent-blue)' }}>All →</Link>
-                </div>
-                {actions.length === 0 ? (
-                  <div className="panel-body" style={{ fontSize: 11.5, color: '#10b981' }}>✓ No immediate actions required</div>
-                ) : actions.map(act => (
-                  <div key={act.id} className="action-item">
-                    <div className={`action-priority priority-${act.priority}`}>{act.priority}</div>
-                    <div>
-                      <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 3 }}>{act.title}</div>
-                      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10.5, color: 'var(--accent-cyan)', background: 'var(--bg-base)', padding: '3px 7px', borderRadius: 2, marginBottom: 4, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{act.how}</div>
-                      <div style={{ fontSize: 10.5, color: '#10b981' }}>↑ {act.estimatedImpact}</div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
           </div>
         )}
 
@@ -406,7 +469,7 @@ export default function QueueDetailPage({ params }: { params: any }) {
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 340px', gap: 10, marginBottom: 8 }}>
           {/* Throughput Trend */}
           <div className="panel">
-            <div className="panel-header"><span className="panel-title">Hourly Throughput (Last 24h)</span></div>
+            <div className="panel-header"><span className="panel-title">Throughput Trend ({timeRange})</span></div>
             <div style={{ padding: '6px 10px 4px' }}>
               <MultiLine
                 data={hourlyThroughputData}
@@ -423,7 +486,7 @@ export default function QueueDetailPage({ params }: { params: any }) {
           {/* Latency & Wait-Time Trend */}
           <div className="panel">
             <div className="panel-header">
-              <span className="panel-title">Performance Trends (Last 24h)</span>
+              <span className="panel-title">Performance Trends ({timeRange})</span>
               {q.p99Latency > 10000 && <span style={{ fontSize: 10, color: '#ef4444' }}>⚠ SLA breach</span>}
             </div>
             <div style={{ padding: '6px 10px 4px' }}>
@@ -571,9 +634,9 @@ export default function QueueDetailPage({ params }: { params: any }) {
             <table className="data-table">
               <thead><tr><th>Job ID</th><th>Name</th><th>State</th><th>Attempts</th><th>Age</th><th>Failure Reason</th><th>Actions</th></tr></thead>
               <tbody>
-                {displayedJobs.length === 0
+                {paginatedJobs.length === 0
                   ? <tr><td colSpan={7} style={{ textAlign: 'center', color: 'var(--text-muted)', padding: 24 }}>No jobs</td></tr>
-                  : displayedJobs.map(job => (
+                  : paginatedJobs.map(job => (
                     <tr key={job.id}>
                       <td><Link href={`/jobs/${job.id}`} style={{ color: 'var(--accent-blue)', fontFamily: 'var(--font-mono)', fontSize: 11.5 }}>{job.id}</Link></td>
                       <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>{job.name}</td>
@@ -600,6 +663,86 @@ export default function QueueDetailPage({ params }: { params: any }) {
               </tbody>
             </table>
           </div>
+
+          {/* Pagination controls */}
+          {totalJobsCount > 0 && (
+            <div style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              padding: '10px 14px',
+              borderTop: '1px solid var(--border)',
+              background: 'var(--bg-panel)',
+              fontSize: 12,
+              color: 'var(--text-secondary)'
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                <span>
+                  Showing {Math.min(totalJobsCount, (currentPage - 1) * pageSize + 1)} to{' '}
+                  {Math.min(totalJobsCount, currentPage * pageSize)} of {totalJobsCount} jobs
+                </span>
+                <select
+                  value={pageSize}
+                  onChange={(e) => {
+                    setPageSize(Number(e.target.value));
+                    setCurrentPage(1);
+                  }}
+                  className="filter-chip"
+                  style={{ background: 'var(--bg-base)', border: '1px solid var(--border)', padding: '2px 8px', borderRadius: 4, cursor: 'pointer' }}
+                >
+                  {[10, 25, 50, 100].map(size => (
+                    <option key={size} value={size}>{size} per page</option>
+                  ))}
+                </select>
+              </div>
+
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                <button
+                  className="btn btn-ghost"
+                  style={{ padding: '4px 10px', fontSize: 11 }}
+                  disabled={currentPage === 1}
+                  onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
+                >
+                  Previous
+                </button>
+                <div style={{ display: 'flex', gap: 4 }}>
+                  {Array.from({ length: Math.min(5, totalPages) }, (_, i) => {
+                    let pageNum = i + 1;
+                    if (totalPages > 5 && currentPage > 3) {
+                      pageNum = currentPage - 2 + i;
+                      if (pageNum + (4 - i) > totalPages) {
+                        pageNum = totalPages - 4 + i;
+                      }
+                    }
+                    return (
+                      <button
+                        key={pageNum}
+                        className={`filter-chip ${pageNum === currentPage ? 'active' : ''}`}
+                        style={{
+                          padding: '4px 8px',
+                          fontSize: 11,
+                          minWidth: 26,
+                          textAlign: 'center',
+                          borderRadius: 3
+                        }}
+                        onClick={() => setCurrentPage(pageNum)}
+                      >
+                        {pageNum}
+                      </button>
+                    );
+                  })}
+                </div>
+                <button
+                  className="btn btn-ghost"
+                  style={{ padding: '4px 10px', fontSize: 11 }}
+                  disabled={currentPage === totalPages}
+                  onClick={() => setCurrentPage(prev => Math.min(totalPages, prev + 1))}
+                >
+                  Next
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </>

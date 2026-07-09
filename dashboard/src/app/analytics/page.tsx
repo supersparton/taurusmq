@@ -24,12 +24,16 @@ export default function AnalyticsPage() {
   const [data, setData] = useState<GlobalAnalyticsPoint[]>([]);
   const [loading, setLoading] = useState(true);
 
+  const [timeRange, setTimeRange] = useState('Last 1h');
+  const [refreshInterval, setRefreshInterval] = useState('5s');
+
   useEffect(() => {
     if (!enabled) return;
     let active = true;
     async function load() {
       try {
-        const res = await getGlobalAnalytics();
+        const apiRange = timeRange === 'Last 7d' ? '7d' : timeRange === 'Last 24h' ? '24h' : '1h';
+        const res = await getGlobalAnalytics(apiRange);
         if (active && res) {
           setData(res);
         }
@@ -40,17 +44,27 @@ export default function AnalyticsPage() {
       }
     }
     load();
-    const interval = setInterval(load, 5000);
+    
+    if (refreshInterval === 'Off') return;
+    const ms = refreshInterval === '5s' ? 5000 : refreshInterval === '15s' ? 15000 : 30000;
+    const interval = setInterval(load, ms);
     return () => {
       active = false;
       clearInterval(interval);
     };
-  }, [enabled]);
+  }, [enabled, timeRange, refreshInterval]);
 
   if (!enabled) {
     return (
       <>
-        <Topbar title="Analytics" subtitle="Aggregated metrics" />
+        <Topbar
+          title="Analytics"
+          subtitle="Aggregated metrics"
+          timeRange={timeRange}
+          onTimeRangeChange={setTimeRange}
+          refreshInterval={refreshInterval}
+          onRefreshIntervalChange={setRefreshInterval}
+        />
         <FeatureLocked featureName="Analytics Dashboard" phase="Phase 4" />
       </>
     );
@@ -89,7 +103,14 @@ export default function AnalyticsPage() {
 
   return (
     <>
-      <Topbar title="Analytics" subtitle="Aggregated metrics · last 1h" />
+      <Topbar
+        title="Analytics"
+        subtitle={`Aggregated metrics · ${timeRange}`}
+        timeRange={timeRange}
+        onTimeRangeChange={setTimeRange}
+        refreshInterval={refreshInterval}
+        onRefreshIntervalChange={setRefreshInterval}
+      />
       <div className="page-content" style={{ padding: 12 }}>
         {loading && data.length === 0 ? (
           <div style={{ padding: '60px 0', textAlign: 'center', color: 'var(--text-muted)' }}>

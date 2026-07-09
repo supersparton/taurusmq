@@ -18,7 +18,7 @@ const PUBLIC_PATHS = ['/login'];
 export function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
   const isPublic     = PUBLIC_PATHS.some(p => pathname.startsWith(p));
-  const hasToken     = req.cookies.has(COOKIE_NAME);
+  const hasToken     = req.cookies.has(COOKIE_NAME) || process.env.TAURUSMQ_AUTH_DISABLED === 'true';
 
   // Authenticated user visiting login → send to dashboard
   if (isPublic && hasToken) {

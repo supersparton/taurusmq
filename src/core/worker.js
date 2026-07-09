@@ -527,6 +527,10 @@ class Worker extends EventEmitter {
                 this.queuename
             );
 
+            if (job.status === 'dead') {
+                await this.redisClient.hset(this.rediskeydlq, job.id, JSON.stringify(job));
+            }
+
             if (job.flow === true || job.flow === false) {
                 await this.redisClient.unblock(job.id, "parent", "children", this.prefix);
             }

@@ -39,15 +39,8 @@ async function main() {
   console.log('================================================================');
 
   // 1. Clean previous state
-  console.log('🧹 Clearing old telemetry keys from Redis...');
-  const keys = await redis.keys('taurusmq:*');
-  if (keys.length > 0) {
-    await redis.del(...keys);
-  }
-  const tmqKeys = await redis.keys('tmq:*');
-  if (tmqKeys.length > 0) {
-    await redis.del(...tmqKeys);
-  }
+  console.log('🧹 Clearing Redis database...');
+  await redis.flushdb();
   console.log('✅ Redis cleaned.');
 
   // 2. Configure Dynamic Alert Rules in Redis

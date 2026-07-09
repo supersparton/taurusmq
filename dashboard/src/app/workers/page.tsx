@@ -1,10 +1,9 @@
 'use client';
 import Topbar from '@/components/layout/Topbar';
-import { HEATMAP_DATA } from '@/lib/intelligence';
 import { fmtMs, relativeTime, workerStateBadge, cpuColor, memColor } from '@/lib/utils';
 import Link from 'next/link';
 import { useState, useEffect } from 'react';
-import { getWorkers } from '@/lib/api';
+import { getWorkers, getWorkerHeatmap } from '@/lib/api';
 import { isFeatureEnabled } from '@/lib/features';
 
 // Heatmap color: green → yellow → red by utilization
@@ -43,45 +42,47 @@ function HeartbeatBar({ history }: { history: number[] }) {
   );
 }
 
-const HOURS = Array.from({ length: 24 }, (_, i) => i);
-const WORKER_IDS = ['wkr_email_01','wkr_email_02','wkr_img_01','wkr_img_02','wkr_report_01','wkr_webhook_01'];
-const WORKER_LABELS: Record<string, string> = {
-  'wkr_email_01': 'email-01', 'wkr_email_02': 'email-02',
-  'wkr_img_01': 'img-01 ⚠', 'wkr_img_02': 'img-02',
-  'wkr_report_01': 'report-01', 'wkr_webhook_01': 'webhook-01',
-};
-
 export default function WorkersPage() {
   const [workersData, setWorkersData] = useState<any[]>([]);
+  const [heatmapData, setHeatmapData] = useState<any[]>([]);
   const isAnalyticsEnabled = isFeatureEnabled('PHASE_4_ANALYTICS');
 
   useEffect(() => {
     let active = true;
     async function load() {
       try {
-        const raw = await getWorkers();
-        if (active && raw) {
-          setWorkersData(raw.map(w => ({
-            id: w.id,
-            hostname: w.host,
-            pid: w.pid,
-            queueName: w.queue,
-            state: w.state === 'working' ? 'online' : w.state, // Map backend 'working' to frontend 'online' for registry
-            activeJobId: w.activeJobs?.[0]?.id,
-            concurrency: w.concurrency,
-            processedJobs: w.processedJobs ?? 0,
-            failedJobs: w.failedJobs ?? 0,
-            lastHeartbeat: w.lastHeartbeat,
-            startedAt: w.startedAt,
-            cpu: Math.round(w.cpuPercent),
-            memory: Math.round((w.memoryBytes ?? 0) / 1024 / 1024),
-            memoryMax: 512,
-            heartbeatHistory: w.heartbeatHistory ?? Array(30).fill(1),
-          })));
+        const [raw, rawHeatmap] = await Promise.all([
+          getWorkers(),
+          isAnalyticsEnabled ? getWorkerHeatmap().catch(() => []) : Promise.resolve([])
+        ]);
+        if (active) {
+          if (raw) {
+            setWorkersData(raw.map(w => ({
+              id: w.id,
+              hostname: w.host,
+              pid: w.pid,
+              queueName: w.queue,
+              state: w.state === 'working' ? 'online' : w.state,
+              activeJobId: typeof w.activeJobs?.[0] === 'object' ? w.activeJobs?.[0]?.id : w.activeJobs?.[0],
+              concurrency: w.concurrency,
+              processedJobs: w.processedJobs ?? 0,
+              failedJobs: w.failedJobs ?? 0,
+              lastHeartbeat: w.lastHeartbeat,
+              startedAt: w.startedAt,
+              cpu: Math.round(w.cpuPercent),
+              memory: Math.round((w.memoryBytes ?? 0) / 1024 / 1024),
+              memoryMax: 512,
+              heartbeatHistory: w.heartbeatHistory ?? Array(30).fill(1),
+            })));
+          }
+          if (rawHeatmap) {
+            setHeatmapData(rawHeatmap);
+          }
         }
       } catch (err) {
         if (active) {
           setWorkersData([]);
+          setHeatmapData([]);
         }
       }
     }
@@ -91,14 +92,26 @@ export default function WorkersPage() {
       active = false;
       clearInterval(interval);
     };
-  }, []);
+  }, [isAnalyticsEnabled]);
 
   const online  = workersData.filter(w => w.state === 'online' || w.state === 'active').length;
   const stalled = workersData.filter(w => w.state === 'stalled').length;
   const idle    = workersData.filter(w => w.state === 'idle').length;
 
-  const heatmapLookup = new Map<string, typeof HEATMAP_DATA[0]>();
-  HEATMAP_DATA.forEach(c => heatmapLookup.set(`${c.workerId}_${c.hour}`, c));
+  const currentHour = new Date().getHours();
+  const HOURS = Array.from({ length: 24 }, (_, i) => (currentHour - 23 + i + 24) % 24);
+
+  const workerIds = Array.from(new Set([
+    ...workersData.map(w => w.id),
+    ...heatmapData.map(c => c.workerId)
+  ])).sort();
+
+  const heatmapLookup = new Map<string, any>();
+  heatmapData.forEach(c => heatmapLookup.set(`${c.workerId}_${c.hour}`, c));
+
+  const workerLabel = (workerId: string) => {
+    return workerId.split('_').slice(1).join('_') || workerId;
+  };
 
   return (
     <>
@@ -136,28 +149,28 @@ export default function WorkersPage() {
             </div>
             <div style={{ padding: '10px 14px', overflowX: 'auto' }}>
               {/* Hour axis */}
-              <div style={{ display: 'flex', marginLeft: 80, marginBottom: 4 }}>
+              <div style={{ display: 'flex', marginLeft: 100, marginBottom: 4 }}>
                 {HOURS.map(h => (
                   <div key={h} style={{
                     width: 28, textAlign: 'center', fontSize: 9.5,
-                    color: h >= 21 ? '#ef4444' : 'var(--text-dim)',
-                    fontFamily: 'var(--font-mono)', fontWeight: h >= 21 ? 700 : 400,
+                    color: 'var(--text-dim)',
+                    fontFamily: 'var(--font-mono)', fontWeight: 400,
                   }}>
                     {String(h).padStart(2, '0')}
                   </div>
                 ))}
-                <div style={{ fontSize: 9, color: '#ef4444', marginLeft: 4, alignSelf: 'center' }}>← incident</div>
               </div>
 
               {/* Rows per worker */}
-              {WORKER_IDS.map(wid => (
+              {workerIds.map(wid => (
                 <div key={wid} style={{ display: 'flex', alignItems: 'center', marginBottom: 4, gap: 0 }}>
                   <div style={{
-                    width: 80, fontSize: 11, fontFamily: 'var(--font-mono)',
-                    color: wid === 'wkr_img_01' ? '#ef4444' : 'var(--text-secondary)',
-                    textAlign: 'right', paddingRight: 8, flexShrink: 0, fontWeight: wid.includes('img') ? 700 : 400,
-                  }}>
-                    {WORKER_LABELS[wid]}
+                    width: 100, fontSize: 10.5, fontFamily: 'var(--font-mono)',
+                    color: 'var(--text-secondary)',
+                    textAlign: 'right', paddingRight: 8, flexShrink: 0,
+                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'
+                  }} title={wid}>
+                    {workerLabel(wid)}
                   </div>
                   {HOURS.map(h => {
                     const cell = heatmapLookup.get(`${wid}_${h}`);
@@ -171,17 +184,12 @@ export default function WorkersPage() {
                         title={`${wid} ${String(h).padStart(2,'0')}:00 — ${util.toFixed(0)}% util · ${fail} failures`}
                         style={{
                           width: 28, height: 20, background: color, margin: '0 1px',
-                          border: h >= 21 ? '1px solid rgba(239,68,68,0.3)' : 'none',
                         }}
                       />
                     );
                   })}
                 </div>
               ))}
-
-              <div style={{ marginTop: 8, fontSize: 11, color: 'var(--text-muted)', fontStyle: 'italic' }}>
-                Red cells at hours 21-23 indicate the active incident window. wkr_img_01 and wkr_img_02 at near-100% with high failure counts.
-              </div>
             </div>
           </div>
         )}

@@ -85,7 +85,7 @@ class MetricsCollector {
     await pipe.exec();
   }
 
-  async _onJobCompleted({ queueName, durationMs, waitingDurationMs }) {
+  async _onJobCompleted({ queueName, durationMs, waitingDurationMs, workerId }) {
     const minuteBucket = this._minuteBucket();
     const tpKey = `tmq:obs:tp:${queueName}:${minuteBucket}`;
 
@@ -113,10 +113,15 @@ class MetricsCollector {
     pipe.hincrbyfloat(hourKey, 'total_wait', waitingDurationMs || 0);
     pipe.expire(hourKey, 604800); // 7 days TTL
 
+    // Update worker specific processed counter
+    if (workerId) {
+      pipe.hincrby(`tmq:obs:worker:${workerId}:state`, 'processed', 1);
+    }
+
     await pipe.exec();
   }
 
-  async _onJobFailed({ queueName, failedReason, willRetry, durationMs, waitingDurationMs }) {
+  async _onJobFailed({ queueName, failedReason, willRetry, durationMs, waitingDurationMs, workerId }) {
     const dateObj = new Date();
     const yyyymmdd = dateObj.toISOString().slice(0, 10);
     const hourStr = String(dateObj.getUTCHours()).padStart(2, '0');
@@ -139,6 +144,11 @@ class MetricsCollector {
     pipe.hincrbyfloat(hourKey, 'total_duration', durationMs || 0);
     pipe.hincrbyfloat(hourKey, 'total_wait', waitingDurationMs || 0);
     pipe.expire(hourKey, 604800); // 7 days TTL
+
+    // Update worker specific failed counter
+    if (workerId) {
+      pipe.hincrby(`tmq:obs:worker:${workerId}:state`, 'failed', 1);
+    }
 
     await pipe.exec();
   }

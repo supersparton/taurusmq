@@ -1,9 +1,21 @@
 'use client';
 import { RefreshCw, Clock, Settings, ChevronDown } from 'lucide-react';
 
-const TIME_RANGES = ['Last 15m', 'Last 1h', 'Last 6h', 'Last 24h', 'Last 7d'];
-
-export default function Topbar({ title, subtitle }: { title: string; subtitle?: string }) {
+export default function Topbar({
+  title,
+  subtitle,
+  timeRange = 'Last 1h',
+  onTimeRangeChange,
+  refreshInterval = '5s',
+  onRefreshIntervalChange,
+}: {
+  title: string;
+  subtitle?: string;
+  timeRange?: string;
+  onTimeRangeChange?: (range: string) => void;
+  refreshInterval?: string;
+  onRefreshIntervalChange?: (interval: string) => void;
+}) {
   return (
     <header style={{
       height: 48,
@@ -26,40 +38,68 @@ export default function Topbar({ title, subtitle }: { title: string; subtitle?: 
         </div>
       </div>
 
-      {/* Time range selector — Grafana pattern */}
-      <button style={{
-        display: 'flex', alignItems: 'center', gap: 6,
-        background: 'var(--bg-elevated)', border: '1px solid var(--border)',
-        borderRadius: 3, padding: '4px 10px', color: 'var(--text-secondary)',
-        fontSize: 12, cursor: 'pointer',
-      }}>
-        <Clock size={12} />
-        Last 1h
-        <ChevronDown size={11} />
-      </button>
+      {/* Time range selector — Grafana style native select */}
+      <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
+        <Clock size={12} style={{ position: 'absolute', left: 10, pointerEvents: 'none', color: 'var(--text-secondary)' }} />
+        <select
+          value={timeRange}
+          onChange={(e) => onTimeRangeChange?.(e.target.value)}
+          style={{
+            background: 'var(--bg-elevated)',
+            border: '1px solid var(--border)',
+            borderRadius: 3,
+            padding: '4px 24px 4px 28px',
+            color: 'var(--text-secondary)',
+            fontSize: 12,
+            cursor: 'pointer',
+            appearance: 'none',
+            outline: 'none',
+          }}
+        >
+          <option value="Last 1h">Last 1h</option>
+          <option value="Last 24h">Last 24h</option>
+          <option value="Last 7d">Last 7d</option>
+        </select>
+        <ChevronDown size={11} style={{ position: 'absolute', right: 8, pointerEvents: 'none', color: 'var(--text-secondary)' }} />
+      </div>
 
-      {/* Auto-refresh indicator */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-        <button style={{
-          display: 'flex', alignItems: 'center', gap: 5,
-          background: 'var(--bg-elevated)', border: '1px solid var(--border)',
-          borderRadius: 3, padding: '4px 10px', color: 'var(--text-secondary)',
-          fontSize: 12, cursor: 'pointer',
-        }}>
-          <RefreshCw size={11} />
-          5s
-        </button>
+      {/* Auto-refresh selector — Native select */}
+      <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
+        <RefreshCw size={11} style={{ position: 'absolute', left: 10, pointerEvents: 'none', color: 'var(--text-secondary)' }} />
+        <select
+          value={refreshInterval}
+          onChange={(e) => onRefreshIntervalChange?.(e.target.value)}
+          style={{
+            background: 'var(--bg-elevated)',
+            border: '1px solid var(--border)',
+            borderRadius: 3,
+            padding: '4px 22px 4px 24px',
+            color: 'var(--text-secondary)',
+            fontSize: 12,
+            cursor: 'pointer',
+            appearance: 'none',
+            outline: 'none',
+          }}
+        >
+          <option value="5s">5s</option>
+          <option value="15s">15s</option>
+          <option value="30s">30s</option>
+          <option value="Off">Off</option>
+        </select>
+        <ChevronDown size={11} style={{ position: 'absolute', right: 6, pointerEvents: 'none', color: 'var(--text-secondary)' }} />
       </div>
 
       {/* Live badge */}
-      <div style={{
-        display: 'flex', alignItems: 'center', gap: 5,
-        background: 'rgba(16,185,129,0.1)', border: '1px solid rgba(16,185,129,0.25)',
-        borderRadius: 3, padding: '3px 8px',
-      }}>
-        <span className="live-dot" style={{ width: 6, height: 6 }} />
-        <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--accent-green)' }}>LIVE</span>
-      </div>
+      {refreshInterval !== 'Off' && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 5,
+          background: 'rgba(16,185,129,0.1)', border: '1px solid rgba(16,185,129,0.25)',
+          borderRadius: 3, padding: '3px 8px',
+        }}>
+          <span className="live-dot" style={{ width: 6, height: 6 }} />
+          <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--accent-green)' }}>LIVE</span>
+        </div>
+      )}
 
       <button style={{
         background: 'transparent', border: 'none',

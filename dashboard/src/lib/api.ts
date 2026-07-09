@@ -97,10 +97,12 @@ export interface QueueMetrics {
 export const getQueues = ()               => apiFetch<QueueMetrics[]>('/api/queues');
 export const getQueue  = (name: string)   => apiFetch<QueueMetrics & { forecast: any; history?: any[] }>(`/api/queues/${encodeURIComponent(name)}`);
 export const getQueueErrors = (name: string) => apiFetch<{ message: string; count: number }[]>(`/api/queues/${encodeURIComponent(name)}/errors`);
+export const getQueueDependencies = () => apiFetch<any[]>('/api/queues/dependencies');
 
 // ── Workers ────────────────────────────────────────────────────────────────────
 
 export const getWorkers = () => apiFetch<any[]>('/api/workers');
+export const getWorkerHeatmap = () => apiFetch<any[]>('/api/workers/heatmap');
 
 // ── Incidents + RCA ────────────────────────────────────────────────────────────
 
@@ -252,4 +254,4 @@ export interface GlobalAnalyticsPoint {
   successRate: number;
 }
 
-export const getGlobalAnalytics = () => apiFetch<GlobalAnalyticsPoint[]>('/api/analytics');
+export const getGlobalAnalytics = (range: string = '1h') => apiFetch<GlobalAnalyticsPoint[]>(`/api/analytics?range=${encodeURIComponent(range)}`);

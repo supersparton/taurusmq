@@ -147,7 +147,7 @@ class MetricsAggregator {
       'updatedAt',           String(now),
     );
 
-    // ── 10. Record history point for charts (keeps last 60 points / 10 minutes) ──
+    // ── 10. Record history point for charts (keeps last 360 points / 1 hour) ──
     const historyItem = JSON.stringify({
       t: now,
       throughput: Math.round(throughput * 100) / 100,
@@ -155,7 +155,7 @@ class MetricsAggregator {
     });
     const histKey = `tmq:obs:metrics:${queue}:history`;
     await redis.rpush(histKey, historyItem);
-    await redis.ltrim(histKey, -60, -1);
+    await redis.ltrim(histKey, -360, -1);
 
     // ── 11. Redesigned Alerts Threshold Evaluation (Push-Based) ───────
     try {
