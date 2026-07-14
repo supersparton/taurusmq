@@ -26,6 +26,9 @@ function getDefaultClient() {
 
 const redisProxy = new Proxy({}, {
     get(target, prop) {
+        if (prop === 'getRedisClient') {
+            return getRedisClient;
+        }
         const client = getDefaultClient();
         const value = client[prop];
         if (typeof value === 'function') {
@@ -34,6 +37,10 @@ const redisProxy = new Proxy({}, {
         return value;
     },
     set(target, prop, value) {
+        if (prop === 'getRedisClient') {
+            target[prop] = value;
+            return true;
+        }
         getDefaultClient()[prop] = value;
         return true;
     }

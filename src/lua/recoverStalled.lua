@@ -70,4 +70,16 @@ for _, jobId in ipairs(stalledJobIds) do
     movedCount = movedCount + 1
 end
 
+-- Self-healing: restore lost signals if signal list count falls below waiting + prioritized count
+local waitingLen = redis.call('LLEN', KEYS[2])
+local prioritizedLen = redis.call('ZCARD', KEYS[4])
+local totalWaiting = waitingLen + prioritizedLen
+local signalLen = redis.call('LLEN', KEYS[3])
+if signalLen < totalWaiting then
+    local diff = totalWaiting - signalLen
+    for i = 1, diff do
+        redis.call('LPUSH', KEYS[3], 1)
+    end
+end
+
 return movedCount

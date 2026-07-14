@@ -97,4 +97,23 @@ else
     end
 end
 
+-- 4. Publish completed/failed event to channel
+local eventsChannel = prefix .. ':' .. queueName .. ':events'
+if status == 'completed' then
+    local returnvalue = nil
+    if returnOrFailedVal and returnOrFailedVal ~= "" then
+        local ok, decoded = pcall(cjson.decode, returnOrFailedVal)
+        if ok then
+            returnvalue = decoded
+        else
+            returnvalue = returnOrFailedVal
+        end
+    end
+    local eventPayload = cjson.encode({ event = 'completed', jobId = jobId, returnvalue = returnvalue })
+    redis.call('PUBLISH', eventsChannel, eventPayload)
+else
+    local eventPayload = cjson.encode({ event = 'failed', jobId = jobId, failedReason = returnOrFailedVal })
+    redis.call('PUBLISH', eventsChannel, eventPayload)
+end
+
 return 1

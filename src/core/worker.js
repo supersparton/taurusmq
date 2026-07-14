@@ -235,7 +235,7 @@ class Worker extends EventEmitter {
                                 this._checkDrained();
                             }
                         } catch (err) {
-                            console.log(`batch job has failed moving to dlq`);
+                            if (this.options.debug) console.log(`batch job has failed moving to dlq`);
                             for (const j of jobs) {
                                 j.status = "dead";
                                 j.failedReason = err.message;
@@ -249,19 +249,19 @@ class Worker extends EventEmitter {
                     }
                     continue;
                 } catch (err) {
-                    console.log(`batch job error:`, err.message);
+                    if (this.options.debug) console.log(`batch job error:`, err.message);
                     this.emit('error', err);
                     continue;
                 }
             }
 
             try {
-                console.log(`[Worker Debug] [Slot Loop] calling blpop on key: ${this.rediskeysignal}`);
+                if (this.options.debug) console.log(`[Worker Debug] [Slot Loop] calling blpop on key: ${this.rediskeysignal}`);
                 const blpopResult = await slotClient.blpop(this.rediskeysignal, 60);
-                console.log(`[Worker Debug] [Slot Loop] blpop returned:`, blpopResult);
+                if (this.options.debug) console.log(`[Worker Debug] [Slot Loop] blpop returned:`, blpopResult);
                 if (!blpopResult) continue; // timeout
                 if (blpopResult[1] === '__shutdown__') {
-                    console.log(`[Worker Debug] [Slot Loop] shutdown signal received`);
+                    if (this.options.debug) console.log(`[Worker Debug] [Slot Loop] shutdown signal received`);
                     continue;
                 }
                 if (this.paused) {
@@ -282,52 +282,46 @@ class Worker extends EventEmitter {
                         continue;
                     }
                 }
-                console.log(`[Worker Debug] [Slot Loop] calling dequeue LUA on key: ${this.rediskey}`);
+                if (this.options.debug) console.log(`[Worker Debug] [Slot Loop] calling dequeue LUA on key: ${this.rediskey}`);
                 const jobjson = await this.redisClient.dequeue(
                     this.rediskey,
                     `${this.prefix}:active:${this.queuename}`,
                     `${this.prefix}:jobs:${this.queuename}`,
                     this.rediskeyprioritized,
-                    Date.now() + this.lockDuration
+                    Date.now(),
+                    this.lockDuration,
+                    `${this.prefix}:${this.queuename}:events`
                 );
-                console.log(`[Worker Debug] [Slot Loop] dequeue returned:`, jobjson);
+                if (this.options.debug) console.log(`[Worker Debug] [Slot Loop] dequeue returned:`, jobjson);
                 if (jobjson) {
                     this.running++;
                     job = JSON.parse(jobjson);
-                    job.attempts++;
-                    job.processedOn = Date.now();
-                    const { updateProgress: _fnInit, ...initialSafe } = job;
-                    const initialJson = JSON.stringify(initialSafe);
-                    await Promise.all([
-                        this.redisClient.publish(`${this.prefix}:${this.queuename}:events`, JSON.stringify({ event: 'active', jobId: job.id, prev: 'waiting' })),
-                        this.redisClient.zadd(`${this.prefix}:active:${this.queuename}`, Date.now() + this.lockDuration, job.id),
-                        this.redisClient.hset(`${this.prefix}:jobs:${this.queuename}`, job.id, initialJson)
-                    ]);
                     this.emit('active', { jobId: job.id, prev: 'waiting' });
 
-                    // Start periodic lease renewal timer
-                    const renewTimer = setInterval(async () => {
-                        try {
-                            if (!this.active) {
-                                clearInterval(renewTimer);
-                                return;
+                    // Start periodic lease renewal timer using deferred timeout pattern
+                    let renewTimer = null;
+                    const scheduleRenewal = () => {
+                        renewTimer = setTimeout(async () => {
+                            try {
+                                if (!this.active) return;
+                                job.processedOn = Date.now();
+                                const { updateProgress: _fnRenew, ...renewSafe } = job;
+                                const renewJson = JSON.stringify(renewSafe);
+                                await Promise.all([
+                                    this.redisClient.hset(`${this.prefix}:jobs:${this.queuename}`, job.id, renewJson),
+                                    this.redisClient.zadd(`${this.prefix}:active:${this.queuename}`, Date.now() + this.lockDuration, job.id)
+                                ]);
+                                scheduleRenewal();
+                            } catch (err) {
+                                this.activeLockTimers.delete(job.id);
+                                if (this.active) {
+                                    this.emit('error', err);
+                                }
                             }
-                            job.processedOn = Date.now();
-                            const { updateProgress: _fnRenew, ...renewSafe } = job;
-                            const renewJson = JSON.stringify(renewSafe);
-                            await Promise.all([
-                                this.redisClient.hset(`${this.prefix}:jobs:${this.queuename}`, job.id, renewJson),
-                                this.redisClient.zadd(`${this.prefix}:active:${this.queuename}`, Date.now() + this.lockDuration, job.id)
-                            ]);
-                        } catch (err) {
-                            clearInterval(renewTimer);
-                            this.activeLockTimers.delete(job.id);
-                            if (this.active) {
-                                this.emit('error', err);
-                            }
-                        }
-                    }, this.lockRenewTime);
-                    this.activeLockTimers.set(job.id, renewTimer);
+                        }, this.lockRenewTime);
+                        this.activeLockTimers.set(job.id, renewTimer);
+                    };
+                    scheduleRenewal();
 
                     // Attach updateProgress so the handler can report progress.
                     job.updateProgress = async (value) => {
@@ -349,37 +343,34 @@ class Worker extends EventEmitter {
 
                     let handlerError = null;
                     try {
-                        console.log(`[Worker Debug] calling handler for job ${job.id}`);
+                        if (this.options.debug) console.log(`[Worker Debug] calling handler for job ${job.id}`);
                         const returnvalue = await this.handler(job);
-                        console.log(`[Worker Debug] handler finished for job ${job.id}`);
+                        if (this.options.debug) console.log(`[Worker Debug] handler finished for job ${job.id}`);
                         job.returnvalue = (returnvalue !== undefined) ? returnvalue : null;
                         job.status = "completed";
-                        console.log(`[Worker Debug] calling finalizejob for job ${job.id}`);
+                        if (this.options.debug) console.log(`[Worker Debug] calling finalizejob for job ${job.id}`);
                         await this.finalizejob(job);
-                        console.log(`[Worker Debug] finalizejob finished for job ${job.id}`);
-                        await this.redisClient.publish(`${this.prefix}:${this.queuename}:events`, JSON.stringify({ event: 'completed', jobId: job.id, returnvalue: job.returnvalue }));
+                        if (this.options.debug) console.log(`[Worker Debug] finalizejob finished for job ${job.id}`);
                         this.emit('completed', { jobId: job.id, returnvalue: job.returnvalue });
-                        console.log(`[Worker Debug] published completed event for job ${job.id}`);
                     } catch (err) {
                         handlerError = err;
                     } finally {
                         const timer = this.activeLockTimers.get(job.id);
                         if (timer) {
-                            clearInterval(timer);
+                            clearTimeout(timer);
                             this.activeLockTimers.delete(job.id);
                         }
-                        console.log(`[Worker Debug] cleared lock timer for job ${job.id}`);
+                        if (this.options.debug) console.log(`[Worker Debug] cleared lock timer for job ${job.id}`);
                     }
 
                     if (handlerError) {
-                        console.log(`job ${job.id} failed : `, handlerError.message);
+                        if (this.options.debug) console.log(`job ${job.id} failed : `, handlerError.message);
                         const { updateProgress: _fn, ...jobSafe } = job;
                         if (handlerError.name === 'Unrecoverable') {
                             job.status = "dead";
                             job.failedReason = handlerError.message;
                             try {
                                 await this.finalizejob(job);
-                                await this.redisClient.publish(`${this.prefix}:${this.queuename}:events`, JSON.stringify({ event: 'failed', jobId: job.id, failedReason: handlerError.message }));
                                 this.emit('failed', { jobId: job.id, failedReason: handlerError.message });
                             } catch (err2) {
                                 if (this.active) {
@@ -389,7 +380,7 @@ class Worker extends EventEmitter {
                         } else if (job.attempts < job.maxretries) {
                             const delay = this.calculatebackoff(job);
                             const nexttime = Date.now() + delay;
-                            console.log(`retrying job ${job.id} (attempt ${job.attempts}/${job.maxretries}) in ${delay / 1000} sec..`);
+                            if (this.options.debug) console.log(`retrying job ${job.id} (attempt ${job.attempts}/${job.maxretries}) in ${delay / 1000} sec..`);
                             jobSafe.status = "retrying";
                             try {
                                 await this.redisClient.hset(`${this.prefix}:jobs:${this.queuename}`, job.id, JSON.stringify(jobSafe));
@@ -403,12 +394,11 @@ class Worker extends EventEmitter {
                                 }
                             }
                         } else {
-                            console.log(`Job ${job.id} hit max retries, moving to dlq`);
+                            if (this.options.debug) console.log(`Job ${job.id} hit max retries, moving to dlq`);
                             job.status = "dead";
                             job.failedReason = handlerError.message;
                             try {
                                 await this.finalizejob(job);
-                                await this.redisClient.publish(`${this.prefix}:${this.queuename}:events`, JSON.stringify({ event: 'failed', jobId: job.id, failedReason: handlerError.message }));
                                 this.emit('failed', { jobId: job.id, failedReason: handlerError.message });
                             } catch (err2) {
                                 if (this.active) {
@@ -420,7 +410,7 @@ class Worker extends EventEmitter {
 
                     this.running--;
                     this._checkDrained();
-                    console.log(`[Worker Debug] iteration complete for job ${job.id}`);
+                    if (this.options.debug) console.log(`[Worker Debug] iteration complete for job ${job.id}`);
                 }
             } catch (err) {
                 console.error("Worker loop error:", err);
@@ -428,18 +418,17 @@ class Worker extends EventEmitter {
                     this.emit('error', err);
                 }
                 if (job) {
-                    console.log(`job ${job.id} failed : `, err.message);
+                    if (this.options.debug) console.log(`job ${job.id} failed : `, err.message);
                     const { updateProgress: _fn, ...jobSafe } = job;
                     if (err.name === 'Unrecoverable') {
                         job.status = "dead";
                         job.failedReason = err.message;
                         try {
                             await this.finalizejob(job);
-                            await this.redisClient.publish(`${this.prefix}:${this.queuename}:events`, JSON.stringify({ event: 'failed', jobId: job.id, failedReason: err.message }));
                             this.emit('failed', { jobId: job.id, failedReason: err.message });
                         } catch (err2) {
                             if (this.active) {
-                                this.emit('error', err2);
+                                    this.emit('error', err2);
                             }
                         }
                         this.running--;
@@ -449,7 +438,7 @@ class Worker extends EventEmitter {
                     if (job.attempts < job.maxretries) {
                         const delay = this.calculatebackoff(job);
                         const nexttime = Date.now() + delay;
-                        console.log(`retrying job ${job.id} (attempt ${job.attempts}/${job.maxretries}) in ${delay / 1000} sec..`);
+                        if (this.options.debug) console.log(`retrying job ${job.id} (attempt ${job.attempts}/${job.maxretries}) in ${delay / 1000} sec..`);
                         jobSafe.status = "retrying";
                         try {
                             await this.redisClient.hset(`${this.prefix}:jobs:${this.queuename}`, job.id, JSON.stringify(jobSafe));
@@ -463,12 +452,11 @@ class Worker extends EventEmitter {
                             }
                         }
                     } else {
-                        console.log(`Job ${job.id} hit max retries, moving to dlq`);
+                        if (this.options.debug) console.log(`Job ${job.id} hit max retries, moving to dlq`);
                         job.status = "dead";
                         job.failedReason = err.message;
                         try {
                             await this.finalizejob(job);
-                            await this.redisClient.publish(`${this.prefix}:${this.queuename}:events`, JSON.stringify({ event: 'failed', jobId: job.id, failedReason: err.message }));
                             this.emit('failed', { jobId: job.id, failedReason: err.message });
                         } catch (err2) {
                             if (this.active) {
@@ -537,7 +525,7 @@ class Worker extends EventEmitter {
             if (job.batchid) {
                 const remaining = await this.redisClient.decr(`${this.prefix}:batch:${job.batchid}:count`);
                 if (parseInt(remaining) === 0) {
-                    console.log(`Batch Completed: ${job.batchid}`);
+                    // console.log(`Batch Completed: ${job.batchid}`);
                     await this.redisClient.del(`${this.prefix}:batch:${job.batchid}:count`);
                 }
             }

@@ -1,0 +1,111 @@
+{
+  "timestamp": "2026-07-14T12:11:46.946Z",
+  "config": {
+    "targetJobs": 50000,
+    "concurrency": 50,
+    "payloadSize": 100,
+    "redisUrl": "redis://127.0.0.1:6379"
+  },
+  "results": {
+    "performance": {
+      "jobs": 50000,
+      "concurrency": 50,
+      "enqueueTimeSec": 1.907,
+      "enqueueThroughput": 26219.192448872574,
+      "consumerTimeSec": 15.767,
+      "consumerThroughput": 3171.180313312615,
+      "avgLatencyMs": 9209.88212,
+      "p50Ms": 9625,
+      "p95Ms": 15129,
+      "p99Ms": 15713,
+      "cpuMs": 14452,
+      "ramDeltaRss": 95,
+      "peakRssMB": 148
+    },
+    "stress": [
+      {
+        "concurrency": 5,
+        "jobs": 5000,
+        "enqueueTimeSec": 0.182,
+        "enqueueThroughput": 27472.527472527472,
+        "consumerTimeSec": 9.517,
+        "consumerThroughput": 525.3756435851634,
+        "avgLatencyMs": 4952.7468,
+        "p50Ms": 4979,
+        "p95Ms": 8979,
+        "p99Ms": 9418,
+        "cpuMs": 2999,
+        "ramDeltaRss": 0,
+        "peakRssMB": 148
+      },
+      {
+        "concurrency": 10,
+        "jobs": 5000,
+        "enqueueTimeSec": 0.228,
+        "enqueueThroughput": 21929.824561403508,
+        "consumerTimeSec": 4.671,
+        "consumerThroughput": 1070.434596446157,
+        "avgLatencyMs": 2495.2884,
+        "p50Ms": 2493,
+        "p95Ms": 4441,
+        "p99Ms": 4642,
+        "cpuMs": 2234,
+        "ramDeltaRss": 0,
+        "peakRssMB": 148
+      },
+      {
+        "concurrency": 20,
+        "jobs": 5000,
+        "enqueueTimeSec": 0.217,
+        "enqueueThroughput": 23041.474654377882,
+        "consumerTimeSec": 2.107,
+        "consumerThroughput": 2373.0422401518745,
+        "avgLatencyMs": 1298.4464,
+        "p50Ms": 1321,
+        "p95Ms": 2040,
+        "p99Ms": 2103,
+        "cpuMs": 1531,
+        "ramDeltaRss": 0,
+        "peakRssMB": 148
+      },
+      {
+        "concurrency": 50,
+        "jobs": 5000,
+        "enqueueTimeSec": 0.185,
+        "enqueueThroughput": 27027.027027027027,
+        "consumerTimeSec": 1.544,
+        "consumerThroughput": 3238.341968911917,
+        "avgLatencyMs": 1072.454,
+        "p50Ms": 1065,
+        "p95Ms": 1526,
+        "p99Ms": 1569,
+        "cpuMs": 1422,
+        "ramDeltaRss": 0,
+        "peakRssMB": 148
+      },
+      {
+        "concurrency": 100,
+        "jobs": 5000,
+        "enqueueTimeSec": 0.223,
+        "enqueueThroughput": 22421.52466367713,
+        "consumerTimeSec": 2.16,
+        "consumerThroughput": 2314.814814814815,
+        "avgLatencyMs": 1610.4722,
+        "p50Ms": 1618,
+        "p95Ms": 2122,
+        "p99Ms": 2170,
+        "cpuMs": 1719,
+        "ramDeltaRss": 0,
+        "peakRssMB": 148
+      }
+    ],
+    "reliability": {
+      "targetJobs": 5000,
+      "completed": 4999,
+      "failed": 1,
+      "dlq": 1,
+      "jobLoss": 0,
+      "recoveryRate": 100
+    }
+  }
+}

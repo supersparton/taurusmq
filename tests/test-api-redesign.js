@@ -1,5 +1,5 @@
 const assert = require('assert');
-const { Queue, Worker, QueueEvents, FlowProducer } = require('./index');
+const { Queue, Worker, QueueEvents, FlowProducer } = require('../index');
 
 async function testExports() {
     console.log("Testing root exports...");

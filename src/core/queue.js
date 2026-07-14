@@ -183,7 +183,7 @@ class Queue {
             pipeline.publish(`${this.prefix}:${this.queuename}:events`, JSON.stringify({ event: 'waiting', jobId: j.id }));
         }
         await pipeline.exec();
-        console.log("bulk running successfully on",this.rediskey);
+        // console.log("bulk running successfully on",this.rediskey);
         return batchid;
     }
     async addbulk(jobsarray, options = {}) {

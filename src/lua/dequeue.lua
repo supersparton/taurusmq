@@ -3,7 +3,9 @@
 -- KEYS[2] = active ZSET    e.g. taurusmq:active:myqueue
 -- KEYS[3] = jobs hash      e.g. taurusmq:jobs:myqueue
 -- KEYS[4] = prioritized    e.g. taurusmq:prioritized:myqueue
--- ARGV[1] = leaseExpirationTimestamp
+-- ARGV[1] = nowMs
+-- ARGV[2] = lockDuration
+-- ARGV[3] = eventsChannel
 
 -- 1. Check prioritized ZSET first
 local jobid = nil
@@ -19,8 +21,26 @@ end
 if jobid then
     local jobjson = redis.call('HGET', KEYS[3], jobid)
     if jobjson then
-        redis.call('ZADD', KEYS[2], tonumber(ARGV[1]), jobid)
-        return jobjson
+        local job = cjson.decode(jobjson)
+        job.attempts = (job.attempts or 0) + 1
+        job.status = 'active'
+        job.processedOn = tonumber(ARGV[1])
+        local updatedJson = cjson.encode(job)
+        
+        -- Update jobs hash
+        redis.call('HSET', KEYS[3], jobid, updatedJson)
+        
+        -- Add to active ZSET
+        local leaseExpiration = tonumber(ARGV[1]) + tonumber(ARGV[2])
+        redis.call('ZADD', KEYS[2], leaseExpiration, jobid)
+        
+        -- Publish active event
+        if ARGV[3] and ARGV[3] ~= "" then
+            local eventPayload = cjson.encode({ event = 'active', jobId = jobid, prev = 'waiting' })
+            redis.call('PUBLISH', ARGV[3], eventPayload)
+        end
+        
+        return updatedJson
     end
 end
 return nil
