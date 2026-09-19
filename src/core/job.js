@@ -2,6 +2,11 @@ const { v4: uuidv4 } = require('uuid');
 
 class Job {
     constructor(name, data, options = {}) {
+        // Validate required fields
+        if (!name || typeof name !== 'string') {
+            throw new Error('Job name is required and must be a string');
+        }
+
         this.name = name;
         this.data = data;
         
@@ -19,8 +24,17 @@ class Job {
         this.timestamp = Date.now();
         this.status = 'waiting';
         this.attempts = 0;
-        this.maxretries = opt.maxretries || 3;
-        this.priority = opt.priority || null;
+
+        // Validate and clamp maxretries (allow 0)
+        const maxRetries = opt.maxretries ?? 3;
+        this.maxretries = Math.max(0, Math.min(100, maxRetries));
+
+        // Validate priority
+        const priority = opt.priority || null;
+        if (priority !== null && (typeof priority !== 'number' || priority < 0)) {
+            throw new Error('Priority must be a non-negative number');
+        }
+        this.priority = priority;
         // options.repeat is the cron expression for repeatable jobs.
         // Previously hardcoded to null — this was the root cause of all delayed/repeat jobs
         // falling through to immediate execution.
@@ -38,7 +52,8 @@ class Job {
         this.progress = null;
         // Return value — written by the worker after the handler resolves
         this.returnvalue = null;
-        this.queue = null;
+        // queue is non-enumerable to avoid circular JSON serialization
+        Object.defineProperty(this, 'queue', { value: null, writable: true, enumerable: false });
     }
     toJson() {
         return JSON.stringify({
@@ -62,42 +77,34 @@ class Job {
         });
     }
 
-    async update(data) {
-        this.data = data;
-        if (this.queue) {
-            const prefix = this.queue.prefix;
-            const queuename = this.queue.queuename;
-            const jobsKey = `${prefix}:jobs:${queuename}`;
-            const dlqKey = `${prefix}:dlq:${queuename}`;
-            
-            const inJobs = await this.queue.client.hexists(jobsKey, this.id);
-            if (inJobs) {
-                await this.queue.client.hset(jobsKey, this.id, this.toJson());
-            } else {
-                const inDlq = await this.queue.client.hexists(dlqKey, this.id);
-                if (inDlq) {
-                    await this.queue.client.hset(dlqKey, this.id, this.toJson());
-                }
-            }
-        }
-    }
-
     async changeDelay(delay) {
         this.delay = delay;
         if (this.queue) {
             const prefix = this.queue.prefix;
             const queuename = this.queue.queuename;
             const jobsKey = `${prefix}:jobs:${queuename}`;
+            const waitingKey = `${prefix}:${queuename}`;
             const delayedKey = `${prefix}:delayed:${queuename}`;
             const signalDelayedKey = `${prefix}:signal:delayed:${queuename}`;
             
-            const exists = await this.queue.client.zscore(delayedKey, this.id);
+            const inDelayed = await this.queue.client.zscore(delayedKey, this.id);
+            const inWaiting = await this.queue.client.lpos(waitingKey, this.id);
             const executetime = Date.now() + delay;
             this.timestamp = executetime;
             
-            if (exists !== null && exists !== undefined) {
+            if (inDelayed !== null && inDelayed !== undefined) {
+                // Already delayed — update score
                 await this.queue.client.zadd(delayedKey, executetime, this.id);
                 await this.queue.client.lpush(signalDelayedKey, executetime);
+            } else if (inWaiting !== null && inWaiting !== undefined) {
+                // Waiting → delayed transition: remove from list, add to delayed ZSET
+                await this.queue.client.lrem(waitingKey, 0, this.id);
+                await this.queue.client.zadd(delayedKey, executetime, this.id);
+                await this.queue.client.lpush(signalDelayedKey, executetime);
+            } else {
+                const e = new Error(`Job ${this.id} is not in waiting or delayed state — cannot change delay`);
+                e.name = 'InvalidState';
+                throw e;
             }
             
             await this.queue.client.hset(jobsKey, this.id, this.toJson());
@@ -125,8 +132,11 @@ class Job {
             job.processedOn = data.processedOn;
             job.progress = data.progress;
             job.returnvalue = data.returnvalue;
+            job.failedReason = data.failedReason || null;
+            job.finishedOn = data.finishedOn || null;
             return job;
-        } catch (_) {
+        } catch (err) {
+            try { require('../utils/logger').createLogger({}).error('corrupt job payload, skipping:', err.message); } catch (_) {}
             return null;
         }
     }

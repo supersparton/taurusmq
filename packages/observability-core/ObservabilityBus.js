@@ -13,7 +13,6 @@ class ObservabilityBus extends EventEmitter {
     super();
     // Allow high number of listeners (one per collector + websocket + incident engine)
     this.setMaxListeners(50);
-    this._enabled = true;
   }
 
   /**
@@ -25,8 +24,6 @@ class ObservabilityBus extends EventEmitter {
    * @returns {Object} the fully-stamped event
    */
   emit(type, payload = {}) {
-    if (!this._enabled) return payload;
-
     const event = {
       id: uuidv4(),
       ts: Date.now(),
@@ -42,10 +39,6 @@ class ObservabilityBus extends EventEmitter {
 
     return event;
   }
-
-  /** Pause all event emission (e.g., during tests) */
-  disable() { this._enabled = false; }
-  enable()  { this._enabled = true;  }
 }
 
 // Singleton — all engine modules share one bus in-process

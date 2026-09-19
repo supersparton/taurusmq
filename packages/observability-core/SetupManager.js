@@ -21,7 +21,6 @@ class SetupManager {
     this.jwtSecret = null;
     this.username = null;
     this.passwordHash = null;
-    this.passwordPlain = null;
   }
 
   /**
@@ -46,7 +45,6 @@ class SetupManager {
       this.username = envUsername;
       // Hash password immediately to clear it from heap memory
       this.passwordHash = await bcrypt.hash(envPassword, 10);
-      this.passwordPlain = null;
       if (!envSecret) {
         if (process.env.NODE_ENV === 'production') {
           throw new Error('[TaurusMQ Error] TAURUSMQ_JWT_SECRET environment variable is required in production.');
@@ -94,9 +92,8 @@ class SetupManager {
     if (process.env.TAURUSMQ_AUTH_DISABLED === 'true') {
       return true;
     }
-    if (this.passwordPlain) {
-      return plaintext === this.passwordPlain;
-    }
+    // NOTE: no plaintext comparison — passwordPlain is always null by design;
+    // the hash is the only credential retained (see setup()).
     if (this.passwordHash) {
       return bcrypt.compare(plaintext, this.passwordHash);
     }

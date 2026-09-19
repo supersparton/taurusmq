@@ -64,10 +64,12 @@ function patchQueue(QueueClass, bus) {
     return jobId;
   };
 
-  // ── queue.addbulk → initialize timelines for batch jobs ──────────────
-  const origAddBulk = QueueClass.prototype.addbulk;
+  // ── queue.addBulk → initialize timelines for batch jobs ─────────────
+  // (Retargeted from the deleted lowercase alias to the real method —
+  // previously this hook never fired for actual addBulk callers.)
+  const origAddBulk = QueueClass.prototype.addBulk;
   if (origAddBulk) {
-    QueueClass.prototype.addbulk = async function(jobsarray, options = {}) {
+    QueueClass.prototype.addBulk = async function(jobsarray, options = {}) {
       const batchId = await origAddBulk.call(this, jobsarray, options);
       const redis = require('../../../src/utils/redis');
       try {

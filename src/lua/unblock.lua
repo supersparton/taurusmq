@@ -1,10 +1,18 @@
+-- Score constants (freeze — changing invalidates existing scores)
+local PRIORITY_SCALE = 100000000000   -- 1e11
+local EPOCH_BASE = 1700000000000      -- 2023-11-14T22:13:20Z
+
+local function calcScore(priority, timestamp)
+    return priority * PRIORITY_SCALE + (timestamp - EPOCH_BASE)
+end
+
 local parentId = KEYS[1]
 local parent = ARGV[1]
 local children = ARGV[2]
 local prefix = ARGV[3] or 'taurusmq'
-local childrenIds = redis.call('SMEMBERS', prefix .. ':dependent:' .. parentId .. ':'..children..':')
+local parentIds = redis.call('SMEMBERS', prefix .. ':dependent:' .. parentId .. ':'..children..':')
 
-for i, childId in ipairs(childrenIds) do
+for i, childId in ipairs(parentIds) do
     
     -- 1. Always remove the relationship to prevent memory leaks
     redis.call('SREM', prefix .. ':dependent:' .. parentId .. ':'..children..':' ,childId)
@@ -39,7 +47,7 @@ for i, childId in ipairs(childrenIds) do
                 end
 
                 if hasPriority then
-                    local score = priorityVal * 100000000000 + (timestampVal - 1700000000000)
+                    local score = calcScore(priorityVal, timestampVal)
                     redis.call('ZADD', prefix .. ':prioritized:' .. queueName, score, childId)
                 else
                     redis.call('RPUSH', prefix .. ':' .. queueName, childId)
@@ -56,4 +64,4 @@ for i, childId in ipairs(childrenIds) do
     end
 end
 
-return #childrenIds
+return #parentIds

@@ -1,0 +1,66 @@
+# TaurusMQ standard stack — single public URL: http://localhost:3000
+#
+#   redis     — job data + observability hot layer (persisted via AOF)
+#   api       — observability API (OBS_PORT 4000, not published)
+#   dashboard — Next.js UI (PORT 3000, published); proxies /api/* + /ws → api
+#
+# Usage:
+#   docker compose up --build -d
+#   open http://localhost:3000/login
+name: taurusmq
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      REDIS_URL: redis://redis:6379
+      OBS_PORT: "4000"
+      TAURUSMQ_QUEUES: ${TAURUSMQ_QUEUES:-default}
+      # Default demo credentials follow tests/test-complex.js convention.
+      # Production: set TAURUSMQ_USERNAME / TAURUSMQ_PASSWORD / TAURUSMQ_JWT_SECRET
+      # in the environment (or TAURUSMQ_AUTH_DISABLED=true for local dev only).
+      TAURUSMQ_USERNAME: ${TAURUSMQ_USERNAME:-admin}
+      TAURUSMQ_PASSWORD: ${TAURUSMQ_PASSWORD:-password}
+      # Required when auth is enabled (NODE_ENV=production in the image).
+      # Override in production: $env:TAURUSMQ_JWT_SECRET="<long-random>"
+      TAURUSMQ_JWT_SECRET: ${TAURUSMQ_JWT_SECRET:-dev-secret-change-in-production}
+      # Same auth switch as the dashboard service — keeps both consistent.
+      # (Compose interpolates from this repo's .env, which disables auth for dev.)
+      TAURUSMQ_AUTH_DISABLED: ${TAURUSMQ_AUTH_DISABLED:-false}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+      # Baked into next.config.ts rewrites() at build time (single-origin proxy).
+      args:
+        TAURUSMQ_API_URL: http://api:4000
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      PORT: "3000"
+      # NOTE: the proxy target is baked at build time via the TAURUSMQ_API_URL
+      # build arg above — a runtime var here would NOT change rewrites().
+      NEXT_PUBLIC_API_URL: ""
+      TAURUSMQ_AUTH_DISABLED: ${TAURUSMQ_AUTH_DISABLED:-false}
+    depends_on:
+      - api
+
+volumes:
+  redis-data:

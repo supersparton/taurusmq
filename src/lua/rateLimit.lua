@@ -3,11 +3,13 @@
 -- ARGV[1] = now (timestamp in ms)
 -- ARGV[2] = duration (ms)
 -- ARGV[3] = max (tokens)
+-- ARGV[4] = jobId (unique member to prevent same-millisecond collisions)
 
 local key = KEYS[1]
 local now = tonumber(ARGV[1])
 local duration = tonumber(ARGV[2])
 local max = tonumber(ARGV[3])
+local jobId = ARGV[4] or tostring(now)
 
 local clearBefore = now - duration
 redis.call('ZREMRANGEBYSCORE', key, 0, clearBefore)
@@ -15,7 +17,7 @@ redis.call('ZREMRANGEBYSCORE', key, 0, clearBefore)
 local count = redis.call('ZCARD', key)
 
 if count < max then
-    redis.call('ZADD', key, now, now)
+    redis.call('ZADD', key, now, jobId)
     redis.call('PEXPIRE', key, duration)
     return {1, 0}
 else

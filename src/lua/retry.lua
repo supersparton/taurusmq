@@ -4,14 +4,27 @@
 -- KEYS[3] = signal list
 -- KEYS[4] = jobs hash
 -- KEYS[5] = prioritized ZSET
+-- KEYS[6] = failed ZSET (for cleanup)
 -- ARGV[1] = jobjson
 -- ARGV[2] = jobid
+
+-- Score constants (freeze — changing invalidates existing scores)
+local PRIORITY_SCALE = 100000000000   -- 1e11
+local EPOCH_BASE = 1700000000000      -- 2023-11-14T22:13:20Z
+
+local function calcScore(priority, timestamp)
+    return priority * PRIORITY_SCALE + (timestamp - EPOCH_BASE)
+end
 
 local jobjson = ARGV[1]
 local jobid = ARGV[2]
 
 if(jobid) then
+    -- Remove from DLQ
     redis.call('HDEL',KEYS[1],jobid)
+    -- Remove from failed ZSET (fixes getJobCounts lying after retry)
+    redis.call('ZREM',KEYS[6],jobid)
+    -- Update vault
     redis.call('HSET',KEYS[4],jobid,jobjson)
     
     local hasPriority = false
@@ -30,9 +43,11 @@ if(jobid) then
     end
 
     if hasPriority then
-        local score = priorityVal * 100000000000 + (timestampVal - 1700000000000)
+        local score = calcScore(priorityVal, timestampVal)
         redis.call('ZADD', KEYS[5], score, jobid)
     else
+        -- Dedup guard: remove from waiting list before re-enqueue (idempotent retry)
+        redis.call('LREM', KEYS[2], 0, jobid)
         redis.call('RPUSH', KEYS[2], jobid)
     end
     

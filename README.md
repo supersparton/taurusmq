@@ -57,11 +57,16 @@ TaurusMQ provides a `FlowProducer` to build parent-child dependency trees.
 
 ---
 
-## BullMQ vs. TaurusMQ Benchmark
+## Historical Benchmarks (July 2026 engine)
+
+> These figures were measured on the July 2026 engine: `addBulk` batches of
+> 1000, 50,000 jobs at concurrency 50, 100-byte payloads, native sub-ms Redis.
+> The engine has since changed (single-fetcher worker, event-publish options,
+> bulk/delayed repair) — current numbers are re-measured in Phase B below.
 
 To evaluate performance, TaurusMQ was benchmarked side-by-side against BullMQ (v5.8.5). The benchmarks were executed **5 times** per suite to collect statistically valid performance, scaling, and resource metrics.
 
-### Benchmark Results (50,000 Jobs, Concurrency = 50)
+### Historical Results (50,000 Jobs, Concurrency = 50)
 
 | Metric | TaurusMQ (Mean) | BullMQ (Mean) | Difference |
 | :--- | :---: | :---: | :---: |
@@ -81,9 +86,26 @@ To evaluate performance, TaurusMQ was benchmarked side-by-side against BullMQ (v
   * **Processing Throughput**: BullMQ consumes jobs **1.94x faster** than TaurusMQ.
   * **Execution Latency**: BullMQ maintains significantly lower average and P95 wait times.
   * **CPU Utilization**: BullMQ completes job execution with **44% less CPU processing overhead**.
-* **Why These Differences Exist**:
-  * **Connection Design**: TaurusMQ workers spawn $C$ blocking connections executing `BLPOP` loops, causing V8 event loop tick latency. BullMQ uses a single connection per worker to poll and dispatch jobs.
-  * **Lua & JSON Churn**: TaurusMQ performs JavaScript and Lua serialization/deserialization cycles (`cjson.decode` inside Redis on job dequeue/completion). BullMQ keeps inputs pre-formatted to reduce V8 and Redis CPU cycles.
+* **Why These Differences Existed** (historical engine):
+  * **Connection Design**: the old workers spawned $C$ blocking connections executing `BLPOP` loops. Since Phase 9 the worker uses exactly 3 connections regardless of concurrency (single fetcher + executor pool).
+  * **Lua & JSON Churn**: JavaScript and Lua serialization/deserialization cycles (`cjson.decode` inside Redis on job dequeue/completion). BullMQ keeps inputs pre-formatted to reduce V8 and Redis CPU cycles.
+
+---
+
+## Current Benchmarks (re-measured in Phase B)
+
+Methodology: `../bench/enqueue-consumer.js` (two rounds: default and
+`publishEvents:false`) plus `../bench/bullmq-baseline.js` parity protocol —
+2,000 jobs at concurrency 10, trivial handler, keep-all retention both sides.
+
+| Phase | TaurusMQ (median of 3) | BullMQ 6.x (median of 3) |
+|---|---|---|
+| Enqueue, direct adds | TBD | TBD |
+| Enqueue, HTTP pipelined | TBD | n/a |
+| Drain, jobs/sec | TBD | TBD |
+| Worker connections | 3 (exact) | TBD (measured footprint) |
+
+*Table filled by Phase B runs. Do not quote single-run numbers.*
 
 ---
 
@@ -96,17 +118,11 @@ Detailed documentation regarding the benchmarking setups:
 
 ### Performance Charts
 
-#### 1. Consumer Throughput vs Concurrency
-![Consumer Throughput vs Concurrency](benchmarks/charts/throughput.png)
-
-#### 2. Latency vs Concurrency (Average & P95)
-![Average Latency vs Concurrency](benchmarks/charts/latency.png)
-![P95 Latency vs Concurrency](benchmarks/charts/p95_latency.png)
-
-#### 3. Resource & Enqueue Comparisons
-![Enqueue Comparison](benchmarks/charts/enqueue_comparison.png)
-![CPU Time Comparison](benchmarks/charts/cpu.png)
-![Memory Usage Comparison](benchmarks/charts/memory.png)
+Historical charts from the legacy benchmark system have been archived
+(see `../taurusmq-archive/benchmarks-old/charts/`). Current numbers are
+reproduced with `npm run bench` (TaurusMQ) and `npm run bench:bullmq`
+(BullMQ parity baseline); the bench scripts live outside the repo at
+`../bench/`.
 
 ---
 
@@ -157,18 +173,17 @@ PASS
 
 #### 1. Memory Stability (Zero Leak Validation)
 Proves that physical memory usage (RSS) flattens once buffers are initialized, and the V8 heap is successfully garbage-collected back to base levels without drift.
-![Endurance Memory Stability](benchmarks/charts/endurance_memory.png)
 
 #### 2. Throughput Stability (No Degradation Validation)
 Verifies that consumption rates remain stable over time with no downward slope or event-loop starvation.
-![Endurance Throughput Stability](benchmarks/charts/endurance_throughput.png)
 
 For details, view the [Detailed Endurance Report](benchmarks/endurance.md).
+Telemetry charts from that run are archived under
+`../taurusmq-archive/benchmarks-old/charts/`.
 
 To run a long-term **3–4 hour endurance test** on your machine:
 ```bash
 node benchmarks/endurance.js --duration=10800
-python benchmarks/generate_endurance_charts.py
 ```
 
 ---
@@ -379,7 +394,7 @@ TaurusMQ includes a built-in Next.js management dashboard:
 
 ```bash
 # Start Dashboard API server (Observability port)
-node packages/observability.js
+node scripts/start-api.js
 
 # Build and start Next.js Dashboard Client
 cd dashboard

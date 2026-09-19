@@ -1,5 +1,6 @@
 const EventEmitter = require('events');
 const { getRedisClient } = require("../utils/redis");
+const { createLogger } = require("../utils/logger");
 const Job = require("./job");
 const cron = require('cron-parser');
 
@@ -25,20 +26,26 @@ class Worker extends EventEmitter {
         this.active = true;
         this.batchsize = options.batchSize || options.batchsize || 1;
         this.backoffstrategies = options.backoffStrategies || options.backoffstrategies || {};
-        // Graceful shutdown: wait up to this many ms for running jobs before force-closing.
         this.shutdownTimeout = options.shutdownTimeout || 30000;
         this.limiter = options.limiter || null;
+        // publishEvents=false disables Redis per-state event publishes
+        // (active/completed/failed/progress/drained) for max throughput.
+        // Local EventEmitter emits still fire, and observability (patchWorker
+        // → bus) uses local hooks, so the dashboard is unaffected. Default
+        // true for QueueEvents back-compat.
+        this.publishEvents = options.publishEvents !== false;
         this.options = options;
+        this.logger = createLogger(options);
 
         this.connectionOpts = options.connection;
-        // Lock lease options for stall prevention
         this.lockDuration = options.lockDuration || 30000;
         this.lockRenewTime = options.lockRenewTime || Math.floor(this.lockDuration / 2);
         this.activeLockTimers = new Map();
         // Shared non-blocking client for all non-BLPOP operations.
         this.redisClient = getRedisClient(this.connectionOpts);
-        // Per-slot blocking clients — allocated in start(), one per concurrency slot.
-        this._slotClients = [];
+        // Single fetcher blocking client (Phase 9) — replaces per-slot clients.
+        this._fetcherClient = null;
+        this._fetcherPromise = null;
 
         this.paused = false;
         this.resumeResolve = null;
@@ -47,16 +54,19 @@ class Worker extends EventEmitter {
         // Graceful-shutdown promise machinery
         this._drainResolve = null;
         this._drainPromise = null;
-        this._slotPromises = [];
+        // Bounded executor pool (Phase 9)
+        this._poolRunning = 0;
+        this._poolQueue = [];
+        // Drain debounce
+        this._lastDrainCheck = 0;
+        this._drainPending = false;
     }
 
     async start() {
-        console.log(`Worker started for queue ${this.queuename} with concurrency ${this.concurrency}`);
+        this.logger.info(`Worker started for queue ${this.queuename} with concurrency ${this.concurrency}`);
 
-        // Fetch initial paused state
         this.paused = (await this.redisClient.get(`${this.prefix}:paused:${this.queuename}`)) === '1';
 
-        // Subscribe to pause/resume pubsub (dedicated blocking connection)
         this.pubsubClient = getRedisClient(this.connectionOpts, true);
         await this.pubsubClient.subscribe(`${this.prefix}:pubsub:${this.queuename}`);
         this.pubsubClient.on('message', (channel, message) => {
@@ -71,65 +81,296 @@ class Worker extends EventEmitter {
             }
         });
 
-        // Allocate one dedicated blocking connection per concurrency slot.
-        const pings = [];
-        for (let i = 0; i < this.concurrency; i++) {
-            const slotClient = getRedisClient(this.connectionOpts, true);
-            this._slotClients.push(slotClient);
-            pings.push(slotClient.ping().then(() => i + 1));
-        }
-        const resolvedSlots = await Promise.all(pings);
-        for (const slotId of resolvedSlots) {
-            const slotClient = this._slotClients[slotId - 1];
-            this._slotPromises.push(this.work(slotId, slotClient));
+        // Single fetcher client (3 connections total regardless of concurrency)
+        this._fetcherClient = getRedisClient(this.connectionOpts, true);
+        await this._fetcherClient.ping();
+        this._fetcherPromise = this._fetcher();
+    }
+
+    // ── Bounded executor pool ────────────────────────────────────────────
+    // Central Redis event publish — no-op when publishEvents is disabled.
+    // (QueueEvents subscribers are the only consumers; obs uses local hooks.)
+    _publishEvent(payload) {
+        if (this.publishEvents === false) return Promise.resolve();
+        return this.redisClient.publish(`${this.prefix}:${this.queuename}:events`, JSON.stringify(payload));
+    }
+
+    _runInPool(fn) {
+        const run = async () => {
+            this._poolRunning++;
+            this.running++;
+            try {
+                await fn();
+            } finally {
+                this._poolRunning--;
+                this.running--;
+                if (this._poolQueue.length > 0) {
+                    const next = this._poolQueue.shift();
+                    next();
+                }
+                this._checkDrained();
+            }
+        };
+        if (this._poolRunning < this.concurrency) {
+            run();
+        } else {
+            this._poolQueue.push(run);
         }
     }
 
+    // ── Single fetcher loop (Phase 9) ────────────────────────────────────
+    async _fetcher() {
+        while (this.active) {
+            if (this.paused) {
+                await new Promise(resolve => {
+                    this.resumeResolve = resolve;
+                    if (!this.paused) resolve();
+                });
+                continue;
+            }
+
+            // Backpressure: wait if pool is full
+            if (this._poolRunning >= this.concurrency) {
+                await sleep(10);
+                continue;
+            }
+
+            try {
+                const blpopResult = await this._fetcherClient.blpop(this.rediskeysignal, 60);
+                if (!blpopResult) continue;
+                if (blpopResult[1] === '__shutdown__') continue;
+                if (this.paused) {
+                    await this.redisClient.lpush(this.rediskeysignal, 1);
+                    continue;
+                }
+                if (this.limiter) {
+                    const now = Date.now();
+                    // Unique member per acquisition: same-ms pickups must not
+                    // collapse into one ZSET member (see rateLimit.lua ARGV[4]).
+                    const attemptId = `${now}:${Math.random().toString(36).slice(2)}`;
+                    const [allowed, waitTime] = await this.redisClient.rateLimit(
+                        `${this.prefix}:limiter:${this.queuename}`,
+                        now,
+                        this.limiter.duration,
+                        this.limiter.max,
+                        attemptId
+                    );
+                    if (allowed === 0) {
+                        await this.redisClient.lpush(this.rediskeysignal, 1);
+                        await sleep(waitTime || 10);
+                        continue;
+                    }
+                }
+
+                if (this.batchsize > 1) {
+                    const batchResult = await this.redisClient.batchdequeue(
+                        this.rediskey,
+                        `${this.prefix}:active:${this.queuename}`,
+                        `${this.prefix}:jobs:${this.queuename}`,
+                        this.rediskeyprioritized,
+                        this.batchsize,
+                        Date.now() + this.lockDuration
+                    );
+                    if (batchResult && batchResult.length > 0) {
+                        const jobs = batchResult.map(JSON.parse);
+                        for (const j of jobs) {
+                            j.attempts = (j.attempts || 0) + 1;
+                            this.emit('active', { jobId: j.id, prev: 'waiting' });
+                            const scheduleRenewal = () => {
+                                const renewTimer = setTimeout(async () => {
+                                    try {
+                                        if (!this.active) return;
+                                        j.processedOn = Date.now();
+                                        const { updateProgress: _fnRenew, ...renewSafe } = j;
+                                        const renewJson = JSON.stringify(renewSafe);
+                                        await Promise.all([
+                                            this.redisClient.hset(`${this.prefix}:jobs:${this.queuename}`, j.id, renewJson),
+                                            this.redisClient.zadd(`${this.prefix}:active:${this.queuename}`, Date.now() + this.lockDuration, j.id)
+                                        ]);
+                                        scheduleRenewal();
+                                    } catch (err) {
+                                        this.activeLockTimers.delete(j.id);
+                                        if (this.active) this.emit('error', err);
+                                    }
+                                }, this.lockRenewTime);
+                                this.activeLockTimers.set(j.id, renewTimer);
+                            };
+                            scheduleRenewal();
+                        }
+                        // One pipelined publish for the whole batch (batchdequeue
+                        // lua publishes nothing — this is the sole active signal).
+                        if (this.publishEvents !== false && jobs.length > 0) {
+                            const pipe = this.redisClient.pipeline();
+                            for (const j of jobs) {
+                                pipe.publish(`${this.prefix}:${this.queuename}:events`, JSON.stringify({ event: 'active', jobId: j.id, prev: 'waiting' }));
+                            }
+                            await pipe.exec();
+                        }
+                        this._runInPool(() => this._executeBatch(jobs));
+                    }
+                } else {
+                    const jobjson = await this.redisClient.dequeue(
+                        this.rediskey,
+                        `${this.prefix}:active:${this.queuename}`,
+                        `${this.prefix}:jobs:${this.queuename}`,
+                        this.rediskeyprioritized,
+                        Date.now(),
+                        this.lockDuration,
+                        // dequeue.lua already guards empty channel (skips PUBLISH)
+                        this.publishEvents === false ? '' : `${this.prefix}:${this.queuename}:events`
+                    );
+                    if (this.options.debug) this.logger.debug(`[Worker Debug] dequeue returned:`, jobjson);
+                    if (jobjson) {
+                        const job = JSON.parse(jobjson);
+                        this._runInPool(() => this._executeJob(job));
+                    }
+                }
+            } catch (err) {
+                if (!this.active) break;
+                // BLPOP throws on disconnect during stop — exit cleanly
+                if (err.message && err.message.includes('Connection is closed')) break;
+                this.logger.error("Worker fetcher error:", err);
+                if (this.active) this.emit('error', err);
+                await sleep(100);
+            }
+        }
+    }
+
+    async _executeBatch(jobs) {
+        try {
+            await this.handler(jobs);
+            for (const j of jobs) {
+                j.status = "completed";
+                const timer = this.activeLockTimers.get(j.id);
+                if (timer) { clearTimeout(timer); this.activeLockTimers.delete(j.id); }
+                await this.scheduleNextRun(j);
+                await this.finalizejob(j);
+                // No extra publish: finalizeJob.lua already published 'completed'.
+                // (The old duplicate line delivered every batch completion twice.)
+                this.emit('completed', { jobId: j.id, returnvalue: j.returnvalue });
+            }
+        } catch (err) {
+            if (this.options.debug) this.logger.debug(`batch job has failed moving to dlq`);
+            for (const j of jobs) {
+                const timer = this.activeLockTimers.get(j.id);
+                if (timer) { clearTimeout(timer); this.activeLockTimers.delete(j.id); }
+                j.status = "dead";
+                j.failedReason = err.message;
+                await this.finalizejob(j);
+                // No extra publish: finalizeJob.lua already published 'failed'.
+                this.emit('failed', { jobId: j.id, failedReason: err.message });
+            }
+        }
+    }
+
+    async _executeJob(job) {
+        this.emit('active', { jobId: job.id, prev: 'waiting' });
+
+        // Lease renewal
+        const scheduleRenewal = () => {
+            const renewTimer = setTimeout(async () => {
+                try {
+                    if (!this.active) return;
+                    job.processedOn = Date.now();
+                    const { updateProgress: _fnRenew, ...renewSafe } = job;
+                    const renewJson = JSON.stringify(renewSafe);
+                    await Promise.all([
+                        this.redisClient.hset(`${this.prefix}:jobs:${this.queuename}`, job.id, renewJson),
+                        this.redisClient.zadd(`${this.prefix}:active:${this.queuename}`, Date.now() + this.lockDuration, job.id)
+                    ]);
+                    scheduleRenewal();
+                } catch (err) {
+                    this.activeLockTimers.delete(job.id);
+                    if (this.active) this.emit('error', err);
+                }
+            }, this.lockRenewTime);
+            this.activeLockTimers.set(job.id, renewTimer);
+        };
+        scheduleRenewal();
+
+        job.updateProgress = async (value) => {
+            job.progress = value;
+            try {
+                const { updateProgress: _fn, ...safe } = job;
+                const safeJson = JSON.stringify(safe);
+                await this.redisClient.hset(`${this.prefix}:jobs:${this.queuename}`, job.id, safeJson);
+                await this._publishEvent({ event: 'progress', jobId: job.id, data: value });
+                this.emit('progress', { jobId: job.id, data: value });
+            } catch (err) {
+                if (this.active) this.emit('error', err);
+            }
+        };
+
+        let handlerError = null;
+        try {
+            if (this.options.debug) this.logger.debug(`[Worker Debug] calling handler for job ${job.id}`);
+            const returnvalue = await this.handler(job);
+            if (this.options.debug) this.logger.debug(`[Worker Debug] handler finished for job ${job.id}`);
+            job.returnvalue = (returnvalue !== undefined) ? returnvalue : null;
+            job.status = "completed";
+            await this.scheduleNextRun(job);
+            if (this.options.debug) this.logger.debug(`[Worker Debug] calling finalizejob for job ${job.id}`);
+            await this.finalizejob(job);
+            if (this.options.debug) this.logger.debug(`[Worker Debug] finalizejob finished for job ${job.id}`);
+            this.emit('completed', { jobId: job.id, returnvalue: job.returnvalue });
+        } catch (err) {
+            handlerError = err;
+        } finally {
+            const timer = this.activeLockTimers.get(job.id);
+            if (timer) {
+                clearTimeout(timer);
+                this.activeLockTimers.delete(job.id);
+            }
+            if (this.options.debug) this.logger.debug(`[Worker Debug] cleared lock timer for job ${job.id}`);
+        }
+
+        if (handlerError) {
+            if (this.options.debug) this.logger.debug(`job ${job.id} failed : `, handlerError.message);
+            await this.handleFailure(job, handlerError);
+        }
+        if (this.options.debug) this.logger.debug(`[Worker Debug] iteration complete for job ${job.id}`);
+    }
+
     async stop() {
-        // Signal work loops to exit after their current iteration
         this.active = false;
 
-        // Clear all active lock renewal timers
         for (const [jobId, timer] of this.activeLockTimers.entries()) {
-            clearInterval(timer);
+            clearTimeout(timer);
         }
         this.activeLockTimers.clear();
 
-        // Wake any slot that is suspended waiting for a resume signal
         if (this.resumeResolve) {
             this.resumeResolve();
             this.resumeResolve = null;
         }
 
-        // Wake idle slots so they exit blpop quickly instead of waiting 60s.
+        // Wake fetcher (1 token, not C)
         try {
-            if (this.concurrency > 0) {
-                const pipe = this.redisClient.pipeline();
-                for (let i = 0; i < this.concurrency; i++) {
-                    pipe.rpush(this.rediskeysignal, '__shutdown__');
-                }
-                await pipe.exec();
-                // Allow a brief moment for the shutdown signals to be delivered to blocked clients
-                await new Promise(r => setTimeout(r, 500));
-            }
+            await this.redisClient.lpush(this.rediskeysignal, '__shutdown__');
         } catch (_) {}
+        await new Promise(r => setTimeout(r, 100));
 
-        // Disconnect per-slot blocking clients to abort active blpop calls immediately.
-        for (const slotClient of this._slotClients) {
-            try { slotClient.disconnect(false); } catch (_) {}
+        if (this._fetcherClient) {
+            try { this._fetcherClient.disconnect(false); } catch (_) {}
+            this._fetcherClient = null;
         }
 
-        // ── Graceful drain: wait for all worker slot loops to finish ─────────────
+        // Wait for pool to drain
         const shutdownPromises = [];
-        if (this._slotPromises && this._slotPromises.length > 0) {
-            const timeoutMs = (this.running === 0) ? 500 : this.shutdownTimeout;
+        if (this._fetcherPromise) {
+            const timeoutMs = this.running === 0 ? 500 : this.shutdownTimeout;
             shutdownPromises.push(
                 Promise.race([
-                    Promise.all(this._slotPromises),
+                    this._fetcherPromise.catch(() => {}),
                     new Promise((resolve) => {
+                        const check = () => {
+                            if (this.running === 0) resolve();
+                            else setTimeout(check, 50);
+                        };
+                        check();
                         setTimeout(() => {
                             if (this.running > 0) {
-                                console.warn(`[TaurusMQ] Worker shutdown timeout (${this.shutdownTimeout}ms) reached with ${this.running} job(s) still running. Force-closing.`);
+                                this.logger.warn(`[TaurusMQ] Worker shutdown timeout (${this.shutdownTimeout}ms) reached with ${this.running} job(s) still running. Force-closing.`);
                             }
                             resolve();
                         }, timeoutMs);
@@ -138,7 +379,6 @@ class Worker extends EventEmitter {
             );
         }
 
-        // Unsubscribe and disconnect pubsub client in parallel with a short timeout
         if (this.pubsubClient) {
             const pubsub = this.pubsubClient;
             this.pubsubClient = null;
@@ -157,317 +397,16 @@ class Worker extends EventEmitter {
         }
 
         await Promise.all(shutdownPromises);
-        this._slotPromises = [];
-        this._slotClients = [];
+        this._fetcherPromise = null;
+        this._poolQueue = [];
 
-        // Clear all active lock renewal timers again, just in case any were added during shutdown
-        for (const [jobId, timer] of this.activeLockTimers.entries()) {
-            clearInterval(timer);
-        }
+        // Timers were already cleared at stop() entry; nothing left to clear.
         this.activeLockTimers.clear();
 
         const redisProxy = require("../utils/redis");
         const connectionIsShared = (this.connectionOpts && typeof this.connectionOpts.duplicate === 'function') || (this.redisClient === redisProxy);
         if (!connectionIsShared && this.redisClient) {
             try { this.redisClient.disconnect(); } catch (_) {}
-        }
-    }
-
-    async work(id, slotClient) {
-        while (this.active) {
-            if (this.paused) {
-                await new Promise(resolve => {
-                    this.resumeResolve = resolve;
-                    if (!this.paused) resolve();
-                });
-                continue;
-            }
-
-            let job = null;
-            if (this.batchsize > 1) {
-                try {
-                    const blpopResult = await slotClient.blpop(this.rediskeysignal, 60);
-                    if (!blpopResult) continue; // timeout
-                    if (blpopResult[1] === '__shutdown__') continue;
-                    if (this.paused) {
-                        await this.redisClient.lpush(this.rediskeysignal, 1);
-                        continue;
-                    }
-                    if (this.limiter) {
-                        const now = Date.now();
-                        const [allowed, waitTime] = await this.redisClient.rateLimit(
-                            `${this.prefix}:limiter:${this.queuename}`,
-                            now,
-                            this.limiter.duration,
-                            this.limiter.max
-                        );
-                        if (allowed === 0) {
-                            await this.redisClient.lpush(this.rediskeysignal, 1);
-                            await sleep(waitTime || 10);
-                            continue;
-                        }
-                    }
-                    const batchResult = await this.redisClient.batchdequeue(
-                        this.rediskey,
-                        `${this.prefix}:active:${this.queuename}`,
-                        `${this.prefix}:jobs:${this.queuename}`,
-                        this.rediskeyprioritized,
-                        this.batchsize,
-                        Date.now() + this.lockDuration
-                    );
-                    if (batchResult && batchResult.length > 0) {
-                        const jobs = batchResult.map(JSON.parse);
-                        for (const j of jobs) {
-                            j.attempts = (j.attempts || 0) + 1;
-                            await this.scheduleNextRun(j);
-                            await this.redisClient.publish(`${this.prefix}:${this.queuename}:events`, JSON.stringify({ event: 'active', jobId: j.id, prev: 'waiting' }));
-                            this.emit('active', { jobId: j.id, prev: 'waiting' });
-                        }
-                        try {
-                            this.running += jobs.length;
-                            await this.handler(jobs);
-                            for (const j of jobs) {
-                                j.status = "completed";
-                                await this.finalizejob(j);
-                                await this.redisClient.publish(`${this.prefix}:${this.queuename}:events`, JSON.stringify({ event: 'completed', jobId: j.id, returnvalue: j.returnvalue }));
-                                this.emit('completed', { jobId: j.id, returnvalue: j.returnvalue });
-                                this.running--;
-                                this._checkDrained();
-                            }
-                        } catch (err) {
-                            if (this.options.debug) console.log(`batch job has failed moving to dlq`);
-                            for (const j of jobs) {
-                                j.status = "dead";
-                                j.failedReason = err.message;
-                                await this.finalizejob(j);
-                                await this.redisClient.publish(`${this.prefix}:${this.queuename}:events`, JSON.stringify({ event: 'failed', jobId: j.id, failedReason: err.message }));
-                                this.emit('failed', { jobId: j.id, failedReason: err.message });
-                                this.running--;
-                                this._checkDrained();
-                            }
-                        }
-                    }
-                    continue;
-                } catch (err) {
-                    if (this.options.debug) console.log(`batch job error:`, err.message);
-                    this.emit('error', err);
-                    continue;
-                }
-            }
-
-            try {
-                if (this.options.debug) console.log(`[Worker Debug] [Slot Loop] calling blpop on key: ${this.rediskeysignal}`);
-                const blpopResult = await slotClient.blpop(this.rediskeysignal, 60);
-                if (this.options.debug) console.log(`[Worker Debug] [Slot Loop] blpop returned:`, blpopResult);
-                if (!blpopResult) continue; // timeout
-                if (blpopResult[1] === '__shutdown__') {
-                    if (this.options.debug) console.log(`[Worker Debug] [Slot Loop] shutdown signal received`);
-                    continue;
-                }
-                if (this.paused) {
-                    await this.redisClient.lpush(this.rediskeysignal, 1);
-                    continue;
-                }
-                if (this.limiter) {
-                    const now = Date.now();
-                    const [allowed, waitTime] = await this.redisClient.rateLimit(
-                        `${this.prefix}:limiter:${this.queuename}`,
-                        now,
-                        this.limiter.duration,
-                        this.limiter.max
-                    );
-                    if (allowed === 0) {
-                        await this.redisClient.lpush(this.rediskeysignal, 1);
-                        await sleep(waitTime || 10);
-                        continue;
-                    }
-                }
-                if (this.options.debug) console.log(`[Worker Debug] [Slot Loop] calling dequeue LUA on key: ${this.rediskey}`);
-                const jobjson = await this.redisClient.dequeue(
-                    this.rediskey,
-                    `${this.prefix}:active:${this.queuename}`,
-                    `${this.prefix}:jobs:${this.queuename}`,
-                    this.rediskeyprioritized,
-                    Date.now(),
-                    this.lockDuration,
-                    `${this.prefix}:${this.queuename}:events`
-                );
-                if (this.options.debug) console.log(`[Worker Debug] [Slot Loop] dequeue returned:`, jobjson);
-                if (jobjson) {
-                    this.running++;
-                    job = JSON.parse(jobjson);
-                    this.emit('active', { jobId: job.id, prev: 'waiting' });
-
-                    // Start periodic lease renewal timer using deferred timeout pattern
-                    let renewTimer = null;
-                    const scheduleRenewal = () => {
-                        renewTimer = setTimeout(async () => {
-                            try {
-                                if (!this.active) return;
-                                job.processedOn = Date.now();
-                                const { updateProgress: _fnRenew, ...renewSafe } = job;
-                                const renewJson = JSON.stringify(renewSafe);
-                                await Promise.all([
-                                    this.redisClient.hset(`${this.prefix}:jobs:${this.queuename}`, job.id, renewJson),
-                                    this.redisClient.zadd(`${this.prefix}:active:${this.queuename}`, Date.now() + this.lockDuration, job.id)
-                                ]);
-                                scheduleRenewal();
-                            } catch (err) {
-                                this.activeLockTimers.delete(job.id);
-                                if (this.active) {
-                                    this.emit('error', err);
-                                }
-                            }
-                        }, this.lockRenewTime);
-                        this.activeLockTimers.set(job.id, renewTimer);
-                    };
-                    scheduleRenewal();
-
-                    // Attach updateProgress so the handler can report progress.
-                    job.updateProgress = async (value) => {
-                        job.progress = value;
-                        try {
-                            const { updateProgress: _fn, ...safe } = job;
-                            const safeJson = JSON.stringify(safe);
-                            await this.redisClient.hset(`${this.prefix}:jobs:${this.queuename}`, job.id, safeJson);
-                            await this.redisClient.publish(`${this.prefix}:${this.queuename}:events`, JSON.stringify({ event: 'progress', jobId: job.id, data: value }));
-                            this.emit('progress', { jobId: job.id, data: value });
-                        } catch (err) {
-                            if (this.active) {
-                                this.emit('error', err);
-                            }
-                        }
-                    };
-
-                    await this.scheduleNextRun(job);
-
-                    let handlerError = null;
-                    try {
-                        if (this.options.debug) console.log(`[Worker Debug] calling handler for job ${job.id}`);
-                        const returnvalue = await this.handler(job);
-                        if (this.options.debug) console.log(`[Worker Debug] handler finished for job ${job.id}`);
-                        job.returnvalue = (returnvalue !== undefined) ? returnvalue : null;
-                        job.status = "completed";
-                        if (this.options.debug) console.log(`[Worker Debug] calling finalizejob for job ${job.id}`);
-                        await this.finalizejob(job);
-                        if (this.options.debug) console.log(`[Worker Debug] finalizejob finished for job ${job.id}`);
-                        this.emit('completed', { jobId: job.id, returnvalue: job.returnvalue });
-                    } catch (err) {
-                        handlerError = err;
-                    } finally {
-                        const timer = this.activeLockTimers.get(job.id);
-                        if (timer) {
-                            clearTimeout(timer);
-                            this.activeLockTimers.delete(job.id);
-                        }
-                        if (this.options.debug) console.log(`[Worker Debug] cleared lock timer for job ${job.id}`);
-                    }
-
-                    if (handlerError) {
-                        if (this.options.debug) console.log(`job ${job.id} failed : `, handlerError.message);
-                        const { updateProgress: _fn, ...jobSafe } = job;
-                        if (handlerError.name === 'Unrecoverable') {
-                            job.status = "dead";
-                            job.failedReason = handlerError.message;
-                            try {
-                                await this.finalizejob(job);
-                                this.emit('failed', { jobId: job.id, failedReason: handlerError.message });
-                            } catch (err2) {
-                                if (this.active) {
-                                    this.emit('error', err2);
-                                }
-                            }
-                        } else if (job.attempts < job.maxretries) {
-                            const delay = this.calculatebackoff(job);
-                            const nexttime = Date.now() + delay;
-                            if (this.options.debug) console.log(`retrying job ${job.id} (attempt ${job.attempts}/${job.maxretries}) in ${delay / 1000} sec..`);
-                            jobSafe.status = "retrying";
-                            try {
-                                await this.redisClient.hset(`${this.prefix}:jobs:${this.queuename}`, job.id, JSON.stringify(jobSafe));
-                                await this.redisClient.zrem(`${this.prefix}:active:${this.queuename}`, job.id);
-                                await this.redisClient.signal(this.rediskeydelayed, this.rediskeysignaldelayed, nexttime, job.id);
-                                await this.redisClient.publish(`${this.prefix}:${this.queuename}:events`, JSON.stringify({ event: 'failed', jobId: job.id, failedReason: handlerError.message }));
-                                this.emit('failed', { jobId: job.id, failedReason: handlerError.message });
-                            } catch (err2) {
-                                if (this.active) {
-                                    this.emit('error', err2);
-                                }
-                            }
-                        } else {
-                            if (this.options.debug) console.log(`Job ${job.id} hit max retries, moving to dlq`);
-                            job.status = "dead";
-                            job.failedReason = handlerError.message;
-                            try {
-                                await this.finalizejob(job);
-                                this.emit('failed', { jobId: job.id, failedReason: handlerError.message });
-                            } catch (err2) {
-                                if (this.active) {
-                                    this.emit('error', err2);
-                                }
-                            }
-                        }
-                    }
-
-                    this.running--;
-                    this._checkDrained();
-                    if (this.options.debug) console.log(`[Worker Debug] iteration complete for job ${job.id}`);
-                }
-            } catch (err) {
-                console.error("Worker loop error:", err);
-                if (this.active) {
-                    this.emit('error', err);
-                }
-                if (job) {
-                    if (this.options.debug) console.log(`job ${job.id} failed : `, err.message);
-                    const { updateProgress: _fn, ...jobSafe } = job;
-                    if (err.name === 'Unrecoverable') {
-                        job.status = "dead";
-                        job.failedReason = err.message;
-                        try {
-                            await this.finalizejob(job);
-                            this.emit('failed', { jobId: job.id, failedReason: err.message });
-                        } catch (err2) {
-                            if (this.active) {
-                                    this.emit('error', err2);
-                            }
-                        }
-                        this.running--;
-                        this._checkDrained();
-                        continue;
-                    }
-                    if (job.attempts < job.maxretries) {
-                        const delay = this.calculatebackoff(job);
-                        const nexttime = Date.now() + delay;
-                        if (this.options.debug) console.log(`retrying job ${job.id} (attempt ${job.attempts}/${job.maxretries}) in ${delay / 1000} sec..`);
-                        jobSafe.status = "retrying";
-                        try {
-                            await this.redisClient.hset(`${this.prefix}:jobs:${this.queuename}`, job.id, JSON.stringify(jobSafe));
-                            await this.redisClient.zrem(`${this.prefix}:active:${this.queuename}`, job.id);
-                            await this.redisClient.signal(this.rediskeydelayed, this.rediskeysignaldelayed, nexttime, job.id);
-                            await this.redisClient.publish(`${this.prefix}:${this.queuename}:events`, JSON.stringify({ event: 'failed', jobId: job.id, failedReason: err.message }));
-                            this.emit('failed', { jobId: job.id, failedReason: err.message });
-                        } catch (err2) {
-                            if (this.active) {
-                                this.emit('error', err2);
-                            }
-                        }
-                    } else {
-                        if (this.options.debug) console.log(`Job ${job.id} hit max retries, moving to dlq`);
-                        job.status = "dead";
-                        job.failedReason = err.message;
-                        try {
-                            await this.finalizejob(job);
-                            this.emit('failed', { jobId: job.id, failedReason: err.message });
-                        } catch (err2) {
-                            if (this.active) {
-                                this.emit('error', err2);
-                            }
-                        }
-                    }
-                    this.running--;
-                    this._checkDrained();
-                }
-            }
         }
     }
 
@@ -479,6 +418,12 @@ class Worker extends EventEmitter {
             resolve();
         }
         if (this.running === 0) {
+            const now = Date.now();
+            if (now - this._lastDrainCheck < 500) return;
+            if (this._drainPending) return;
+            this._drainPending = true;
+            this._lastDrainCheck = now;
+
             try {
                 const [activeCount, waitCount, prioritizedCount] = await Promise.all([
                     this.redisClient.zcard(`${this.prefix}:active:${this.queuename}`),
@@ -486,13 +431,15 @@ class Worker extends EventEmitter {
                     this.redisClient.zcard(`${this.prefix}:prioritized:${this.queuename}`)
                 ]);
                 if (activeCount === 0 && waitCount === 0 && prioritizedCount === 0) {
-                    await this.redisClient.publish(`${this.prefix}:${this.queuename}:events`, JSON.stringify({ event: 'drained' }));
+                    await this._publishEvent({ event: 'drained' });
                     this.emit('drained');
                 }
             } catch (err) {
                 if (this.active) {
                     this.emit('error', err);
                 }
+            } finally {
+                this._drainPending = false;
             }
         }
     }
@@ -512,25 +459,86 @@ class Worker extends EventEmitter {
                 this.options.removeOnComplete !== undefined ? this.options.removeOnComplete : 1000,
                 this.options.removeOnFail !== undefined ? this.options.removeOnFail : 1000,
                 this.prefix,
-                this.queuename
+                this.queuename,
+                // Omitted by older callers → nil → lua defaults to publishing
+                this.publishEvents === false ? '0' : '1'
             );
 
             if (job.status === 'dead') {
                 await this.redisClient.hset(this.rediskeydlq, job.id, JSON.stringify(job));
             }
 
-            if (job.flow === true || job.flow === false) {
-                await this.redisClient.unblock(job.id, "parent", "children", this.prefix);
+            // DAG participants: fan-in children (false), legacy flag (true),
+            // fan-out parents/children ('fan-out'). Completion must release
+            // jobs blocked on this job via unblock().
+            if (job.flow === true || job.flow === false || job.flow === 'fan-out') {
+                if (job.status === 'completed') {
+                    await this.redisClient.unblock(job.id, "parent", "children", this.prefix);
+                } else {
+                    const parents = job.parent || [];
+                    for (const parentId of parents) {
+                        const parentJson = await this.redisClient.hget(`${this.prefix}:jobs:${this.queuename}`, parentId);
+                        if (parentJson) {
+                            const parentJob = JSON.parse(parentJson);
+                            parentJob.status = 'dead';
+                            parentJob.failedReason = `child ${job.id} failed: ${job.failedReason || 'unknown error'}`;
+                            await this.redisClient.hset(`${this.prefix}:jobs:${this.queuename}`, parentId, JSON.stringify(parentJob));
+                            await this.redisClient.hset(this.rediskeydlq, parentId, JSON.stringify(parentJob));
+                            await this.redisClient.hdel(`${this.prefix}:blocked:${this.queuename}`, parentId);
+                            await this.redisClient.del(`${this.prefix}:job:${parentId}:count`);
+                            await this.redisClient.del(`${this.prefix}:job:${parentId}:name`);
+                            await this.redisClient.zadd(`${this.prefix}:failed:${this.queuename}`, Date.now(), parentId);
+                            await this._publishEvent({
+                                event: 'failed', jobId: parentId, failedReason: parentJob.failedReason
+                            });
+                        }
+                    }
+                }
             }
             if (job.batchid) {
                 const remaining = await this.redisClient.decr(`${this.prefix}:batch:${job.batchid}:count`);
                 if (parseInt(remaining) === 0) {
-                    // console.log(`Batch Completed: ${job.batchid}`);
                     await this.redisClient.del(`${this.prefix}:batch:${job.batchid}:count`);
                 }
             }
         } catch (err) {
             this.emit('error', err);
+        }
+    }
+
+    async handleFailure(job, err) {
+        if (err.name === 'Unrecoverable') {
+            job.status = "dead";
+            job.failedReason = err.message;
+            try {
+                await this.finalizejob(job);
+                this.emit('failed', { jobId: job.id, failedReason: err.message });
+            } catch (err2) {
+                if (this.active) this.emit('error', err2);
+            }
+        } else if (job.attempts < job.maxretries) {
+            const delay = this.calculatebackoff(job);
+            const nexttime = Date.now() + delay;
+            const { updateProgress: _fn, ...jobSafe } = job;
+            jobSafe.status = "retrying";
+            try {
+                await this.redisClient.hset(`${this.prefix}:jobs:${this.queuename}`, job.id, JSON.stringify(jobSafe));
+                await this.redisClient.zrem(`${this.prefix}:active:${this.queuename}`, job.id);
+                await this.redisClient.signal(this.rediskeydelayed, this.rediskeysignaldelayed, nexttime, job.id);
+                await this._publishEvent({ event: 'failed', jobId: job.id, failedReason: err.message });
+                this.emit('failed', { jobId: job.id, failedReason: err.message });
+            } catch (err2) {
+                if (this.active) this.emit('error', err2);
+            }
+        } else {
+            job.status = "dead";
+            job.failedReason = err.message;
+            try {
+                await this.finalizejob(job);
+                this.emit('failed', { jobId: job.id, failedReason: err.message });
+            } catch (err2) {
+                if (this.active) this.emit('error', err2);
+            }
         }
     }
 
@@ -572,9 +580,9 @@ class Worker extends EventEmitter {
                 executetime,
                 job.id
             );
-            console.log(`Scheduled next run for ${new Date(executetime).toLocaleTimeString()} in ${this.prefix}:${this.queuename} of Job ${job.id}`);
+            this.logger.info(`Scheduled next run for ${new Date(executetime).toLocaleTimeString()} in ${this.prefix}:${this.queuename} of Job ${job.id}`);
         } catch (err) {
-            console.error("Cron rescheduling failed:", err.message, `for ${this.prefix}:${this.queuename} of Job ${job.id}`);
+            this.logger.error("Cron rescheduling failed:", err.message, `for ${this.prefix}:${this.queuename} of Job ${job.id}`);
         }
     }
 

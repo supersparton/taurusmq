@@ -22,7 +22,13 @@ if jobid then
     local jobjson = redis.call('HGET', KEYS[3], jobid)
     if jobjson then
         local job = cjson.decode(jobjson)
-        job.attempts = (job.attempts or 0) + 1
+        -- Only increment attempts on first pickup (processedOn is null).
+        -- Stall recovery re-queues with processedOn already set — that
+        -- counts as the worker dying, not the job failing.
+        local isFirstPickup = not job.processedOn or job.processedOn == cjson.null
+        if isFirstPickup then
+            job.attempts = (job.attempts or 0) + 1
+        end
         job.status = 'active'
         job.processedOn = tonumber(ARGV[1])
         local updatedJson = cjson.encode(job)

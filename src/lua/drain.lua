@@ -6,29 +6,32 @@
 -- KEYS[5] = signal list        e.g. taurusmq:signal:myqueue
 -- KEYS[6] = delayed signal list e.g. taurusmq:signal:delayed:myqueue
 
-local waiting = redis.call('LRANGE', KEYS[1], 0, -1)
-local prioritized = redis.call('ZRANGE', KEYS[2], 0, -1)
-local delayed = redis.call('ZRANGE', KEYS[3], 0, -1)
-
-local function deleteJobs(jobIds, hashKey)
-    if #jobIds > 0 then
-        for i = 1, #jobIds, 5000 do
-            local chunk = {}
-            for j = i, math.min(i + 4999, #jobIds) do
-                table.insert(chunk, jobIds[j])
-            end
-            redis.call('HDEL', hashKey, unpack(chunk))
-        end
+-- Batched LRANGE/LTRIM: never load entire list at once.
+-- Batches are capped at 500, so a single HDEL per batch suffices.
+local function drainList(listKey, hashKey)
+    while true do
+        local batch = redis.call('LRANGE', listKey, 0, 499)
+        if #batch == 0 then break end
+        redis.call('HDEL', hashKey, unpack(batch))
+        redis.call('LTRIM', listKey, #batch, -1)
     end
 end
 
-deleteJobs(waiting, KEYS[4])
-deleteJobs(prioritized, KEYS[4])
-deleteJobs(delayed, KEYS[4])
+drainList(KEYS[1], KEYS[4])
 
-redis.call('DEL', KEYS[1])
-redis.call('DEL', KEYS[2])
-redis.call('DEL', KEYS[3])
+-- ZSETs: delete in batches of 500
+local function drainZset(zsetKey, hashKey)
+    while true do
+        local batch = redis.call('ZRANGE', zsetKey, 0, 499)
+        if #batch == 0 then break end
+        redis.call('HDEL', hashKey, unpack(batch))
+        redis.call('ZREM', zsetKey, unpack(batch))
+    end
+end
+
+drainZset(KEYS[2], KEYS[4])
+drainZset(KEYS[3], KEYS[4])
+
 redis.call('DEL', KEYS[5])
 redis.call('DEL', KEYS[6])
 

@@ -14,10 +14,10 @@ function getDefaultClient() {
             maxRetriesPerRequest: null,
         });
         defaultClient.on('connect', () => {
-            console.log('TaurusMQ: Successfully connected to Redis');
+            try { require('./logger').createLogger({}).info('Successfully connected to Redis'); } catch (_) {}
         });
         defaultClient.on('error', (err) => {
-            console.error('TaurusMQ: Redis Connection Error:', err.message);
+            try { require('./logger').createLogger({}).error('Redis Connection Error:', err.message); } catch (_) {}
         });
         defineCommands(defaultClient);
     }
@@ -79,7 +79,7 @@ function defineCommands(client) {
     }
     if (!client.retry) {
         client.defineCommand('retry', {
-            numberOfKeys: 5,
+            numberOfKeys: 6,
             lua: fs.readFileSync(path.join(__dirname, '../lua/retry.lua'), 'utf-8')
         });
     }
@@ -87,6 +87,18 @@ function defineCommands(client) {
         client.defineCommand('addJob', {
             numberOfKeys: 4,
             lua: fs.readFileSync(path.join(__dirname, '../lua/addJob.lua'), 'utf-8')
+        });
+    }
+    if (!client.addDelayed) {
+        client.defineCommand('addDelayed', {
+            numberOfKeys: 3,
+            lua: fs.readFileSync(path.join(__dirname, '../lua/addDelayed.lua'), 'utf-8')
+        });
+    }
+    if (!client.addBulk) {
+        client.defineCommand('addBulk', {
+            numberOfKeys: 5,
+            lua: fs.readFileSync(path.join(__dirname, '../lua/addBulk.lua'), 'utf-8')
         });
     }
     if (!client.recoverStalled) {
@@ -113,6 +125,12 @@ function defineCommands(client) {
             lua: fs.readFileSync(path.join(__dirname, '../lua/finalizeJob.lua'), 'utf-8')
         });
     }
+    if (!client.promoteIfUnblocked) {
+        client.defineCommand('promoteIfUnblocked', {
+            numberOfKeys: 4,
+            lua: fs.readFileSync(path.join(__dirname, '../lua/promoteIfUnblocked.lua'), 'utf-8')
+        });
+    }
     return client;
 }
 
@@ -122,7 +140,7 @@ function getRedisClient(connectionOptsOrInstance, isBlocking = false) {
             const dup = connectionOptsOrInstance.duplicate();
             dup.options.maxRetriesPerRequest = null;
             dup.on('error', (err) => {
-                console.error('TaurusMQ [Blocking Duplicated Client] Error:', err.message);
+                try { require('./logger').createLogger({}).error('[Blocking Duplicated Client] Error:', err.message); } catch (_) {}
             });
             return defineCommands(dup);
         }
@@ -132,7 +150,7 @@ function getRedisClient(connectionOptsOrInstance, isBlocking = false) {
     if (typeof connectionOptsOrInstance === 'string') {
         const client = new Redis(connectionOptsOrInstance, { maxRetriesPerRequest: null });
         client.on('error', (err) => {
-            console.error('TaurusMQ Client Error:', err.message);
+            try { require('./logger').createLogger({}).error('Client Error:', err.message); } catch (_) {}
         });
         return defineCommands(client);
     }
@@ -140,7 +158,7 @@ function getRedisClient(connectionOptsOrInstance, isBlocking = false) {
     if (connectionOptsOrInstance && typeof connectionOptsOrInstance === 'object') {
         const client = new Redis({ maxRetriesPerRequest: null, ...connectionOptsOrInstance });
         client.on('error', (err) => {
-            console.error('TaurusMQ Client Error:', err.message);
+            try { require('./logger').createLogger({}).error('Client Error:', err.message); } catch (_) {}
         });
         return defineCommands(client);
     }
@@ -150,7 +168,7 @@ function getRedisClient(connectionOptsOrInstance, isBlocking = false) {
         const dup = getDefaultClient().duplicate();
         dup.options.maxRetriesPerRequest = null;
         dup.on('error', (err) => {
-            console.error('TaurusMQ [Blocking Default Client] Error:', err.message);
+            try { require('./logger').createLogger({}).error('[Blocking Default Client] Error:', err.message); } catch (_) {}
         });
         return defineCommands(dup);
     }

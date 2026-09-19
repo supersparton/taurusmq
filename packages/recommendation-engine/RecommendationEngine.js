@@ -7,6 +7,19 @@
 const redis      = require('../../src/utils/redis');
 const { PLAYBOOK } = require('./playbook');
 
+// Push-stack incidents carry custom ruleIds (rule_xxx) plus a metric label.
+// Map the metric vocabulary (MetricsAggregator switch) onto playbook ruleIds
+// so live incidents actually match. Metrics without playbook coverage
+// (active, health_score/health) intentionally yield no recommendations.
+const METRIC_TO_RULE = {
+  error_rate:      'high_failure_rate',
+  failure_rate:    'high_failure_rate',
+  failed:          'high_failure_rate',
+  waiting:         'queue_backlog',
+  avg_latency_ms:  'high_p99_latency',
+  latency:         'high_p99_latency',
+};
+
 class RecommendationEngine {
   /**
    * Generate recommendations for all currently firing incidents.
@@ -23,7 +36,23 @@ class RecommendationEngine {
         ? await redis.hgetall(`tmq:obs:materialized:${incident.scopeTarget}`) ?? {}
         : {};
 
-      const matchingRules = PLAYBOOK.filter(p => p.ruleId === incident.ruleId);
+      // Match by static ruleId first, then by push-stack metric label.
+      // Push labels are {queue, metric, threshold, current}; playbook builders
+      // expect richer labels, so backfill the value fields from `current`.
+      const fallbackRule = METRIC_TO_RULE[incident.labels?.metric];
+      const matchingRules = PLAYBOOK.filter(p =>
+        p.ruleId === incident.ruleId || (fallbackRule && p.ruleId === fallbackRule)
+      );
+      const view = {
+        ...incident,
+        labels: {
+          actual:     incident.labels?.current,
+          growthRate: incident.labels?.current,
+          waiting:    incident.labels?.current,
+          p99Ms:      incident.labels?.current,
+          ...incident.labels,
+        },
+      };
 
       for (const rule of matchingRules) {
         recommendations.push({
@@ -35,9 +64,9 @@ class RecommendationEngine {
           incidentId:       incident.id,
           incidentName:     incident.ruleName,
           scopeTarget:      incident.scopeTarget,
-          why:              rule.buildWhy(incident, metrics),
-          how:              rule.buildHow(incident, metrics),
-          estimatedImpact:  rule.buildImpact(incident, metrics),
+          why:              rule.buildWhy(view, metrics),
+          how:              rule.buildHow(view, metrics),
+          estimatedImpact:  rule.buildImpact(view, metrics),
           estimatedTimeMin: rule.estimatedTimeMin,
           evidence:         incident.evidence,
           firedAt:          incident.firedAt,
@@ -76,8 +105,14 @@ class RecommendationEngine {
 
     const hypotheses = [];
 
-    // Build hypotheses based on rule + available evidence
-    if (incident.ruleId === 'high_failure_rate' || incident.ruleId === 'queue_no_drain') {
+    // Build hypotheses based on rule + available evidence.
+    // Push-stack incidents carry custom ruleIds, so match on the metric label
+    // too (same vocabulary as generate()'s METRIC_TO_RULE).
+    const rcaMetric = incident.labels?.metric;
+    const isFailureLike =
+      incident.ruleId === 'high_failure_rate' || incident.ruleId === 'queue_no_drain' ||
+      ['error_rate', 'failure_rate', 'failed', 'waiting', 'active'].includes(rcaMetric);
+    if (isFailureLike) {
       const errorRate = parseFloat(metrics.errorRate ?? '0');
       const failed    = parseInt(metrics.failed      ?? '0', 10);
       const waiting   = parseInt(metrics.waiting     ?? '0', 10);

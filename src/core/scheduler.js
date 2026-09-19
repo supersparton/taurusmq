@@ -1,4 +1,5 @@
 const { getRedisClient } = require("../utils/redis");
+const { createLogger } = require("../utils/logger");
 
 class Scheduler {
     constructor(queuename, timeOrOptions, options = {}) {
@@ -21,11 +22,11 @@ class Scheduler {
         this.rediskeysignaldelayed = `${this.prefix}:signal:delayed:${queuename}`;
         this.rediskeyblocked = `${this.prefix}:blocked:${queuename}`;
         this.active = true;
-        this.timeout = time;
-        
+
         this.connectionOpts = opts.connection;
         this.redisClient = getRedisClient(this.connectionOpts);
         this.client = getRedisClient(this.connectionOpts, true);
+        this.logger = createLogger(opts);
 
         this.watchdogTimer = null;
         this.watchdogResolve = null;
@@ -33,7 +34,7 @@ class Scheduler {
         this.delayedResolve = null;
     }
     async start() {
-        console.log(`watchdog started for queue: ${this.queuename}`);
+        this.logger.info(`watchdog started for queue: ${this.queuename}`);
         while (this.active) {
             try {
                 const now = Date.now();
@@ -44,15 +45,14 @@ class Scheduler {
                     this.rediskeyprioritized,
                     `${this.prefix}:jobs:${this.queuename}`,
                     `${this.prefix}:dlq:${this.queuename}`,
-                    now,
-                    this.timeout
+                    now
                 );
                 if (recoveredCount > 0) {
-                    console.log(`Watchdog: Recovered ${recoveredCount} stalled job(s) for queue: ${this.queuename}`);
+                    this.logger.info(`Watchdog: Recovered ${recoveredCount} stalled job(s) for queue: ${this.queuename}`);
                 }
             }
             catch (err) {
-                console.log("Watchdog error : ", err.message);
+                this.logger.error("Watchdog error : ", err.message);
             }
             if (this.active) {
                 await new Promise(resolve => {
@@ -79,14 +79,16 @@ class Scheduler {
                      now
                  );
                  if (promoted && promoted.length > 0) {
-                     console.log(`${promoted.length} jobs promoted for queue : ${this.queuename}`);
+                     this.logger.info(`${promoted.length} jobs promoted for queue : ${this.queuename}`);
                  }
                 const nexttime = await this.redisClient.zrange(this.rediskeydelayed,0,0,'WITHSCORES');
                 let waitms = 30000;
                 if(nexttime && nexttime.length>0){
                     waitms = parseInt(nexttime[1])-now;
                 }
-                if(waitms<=0){}
+                // Overdue head (or promote race): yield briefly instead of
+                // busy-spinning the promote+zrange pair.
+                if(waitms<=0){ await new Promise(r => setTimeout(r, 50)); }
                 else if(waitms<=1000){
                     if (this.active) {
                         await new Promise(resolve => {
@@ -104,15 +106,18 @@ class Scheduler {
                 }
              }
              catch(err){
-                console.log("Promotion error : ", err.message);
+                this.logger.error("Promotion error : ", err.message);
              }
          }
     }
     async stop() {
         this.active = false;
-        if (this.client) {
-            this.client.disconnect(false);
-        }
+
+        // Wake the delayedjobs BLPOP before disconnecting to avoid race
+        try {
+            await this.redisClient.lpush(this.rediskeysignaldelayed, '__shutdown__');
+        } catch (_) {}
+
         if (this.watchdogTimer) {
             clearTimeout(this.watchdogTimer);
             this.watchdogTimer = null;
@@ -128,6 +133,13 @@ class Scheduler {
         if (this.delayedResolve) {
             this.delayedResolve();
             this.delayedResolve = null;
+        }
+
+        // Brief delay to let BLPOP receive the wake token
+        await new Promise(r => setTimeout(r, 100));
+
+        if (this.client) {
+            try { this.client.disconnect(false); } catch (_) {}
         }
 
         const redisProxy = require("../utils/redis");

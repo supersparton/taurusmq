@@ -5,7 +5,9 @@
 // No manual token handling needed in the frontend.
 // credentials: 'include' is required to send cookies cross-origin (localhost:3333 → localhost:4000).
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000';
+// Single-origin standard: same-origin proxy (next.config.ts rewrites /api/* → API).
+// NEXT_PUBLIC_API_URL override is kept for hosted/SaaS mode only.
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '';
 
 async function apiFetch<T>(
   path: string,
@@ -96,7 +98,6 @@ export interface QueueMetrics {
 
 export const getQueues = ()               => apiFetch<QueueMetrics[]>('/api/queues');
 export const getQueue  = (name: string)   => apiFetch<QueueMetrics & { forecast: any; history?: any[] }>(`/api/queues/${encodeURIComponent(name)}`);
-export const getQueueErrors = (name: string) => apiFetch<{ message: string; count: number }[]>(`/api/queues/${encodeURIComponent(name)}/errors`);
 export const getQueueDependencies = () => apiFetch<any[]>('/api/queues/dependencies');
 
 // ── Workers ────────────────────────────────────────────────────────────────────
@@ -107,13 +108,7 @@ export const getWorkerHeatmap = () => apiFetch<any[]>('/api/workers/heatmap');
 // ── Incidents + RCA ────────────────────────────────────────────────────────────
 
 export const getIncidents      = ()           => apiFetch<{ firing: any[]; history: any[] }>('/api/incidents');
-export const getRCA            = (id: string) => apiFetch<any[]>(`/api/incidents/${id}/rca`);
 export const getRecommendations = ()          => apiFetch<any[]>('/api/recommendations');
-
-// ── Forecast + Cost ────────────────────────────────────────────────────────────
-
-export const getForecast = () => apiFetch<any[]>('/api/forecast');
-export const getCost     = () => apiFetch<any[]>('/api/cost');
 
 // ── Events ─────────────────────────────────────────────────────────────────────
 

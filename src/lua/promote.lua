@@ -6,6 +6,14 @@
 -- KEYS[5] = jobs hash        e.g. taurusmq:jobs:myqueue
 -- ARGV[1] = now
 
+-- Score constants (freeze — changing invalidates existing scores)
+local PRIORITY_SCALE = 100000000000   -- 1e11
+local EPOCH_BASE = 1700000000000      -- 2023-11-14T22:13:20Z
+
+local function calcScore(priority, timestamp)
+    return priority * PRIORITY_SCALE + (timestamp - EPOCH_BASE)
+end
+
 local jobs = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1]);
 
 local prefix, queueName = string.match(KEYS[1], "^(.+):delayed:(.+)$")
@@ -31,7 +39,7 @@ if #jobs > 0 then
         end
 
         if hasPriority then
-            local score = priorityVal * 100000000000 + (timestampVal - 1700000000000)
+            local score = calcScore(priorityVal, timestampVal)
             redis.call('ZADD', KEYS[4], score, job)
         else
             redis.call('RPUSH', KEYS[2], job)

@@ -6,8 +6,10 @@
     "dashboard"
   ],
   "scripts": {
-    "test": "node run-all-tests.js",
-    "test:coverage": "node --test --experimental-test-coverage tests/test-fault-tolerance.js",
+    "test": "vitest run tests/vitest",
+    "test:vitest": "vitest run tests/vitest",
+    "bench": "node ../bench/enqueue-consumer.js",
+    "bench:bullmq": "node ../bench/bullmq-baseline.js",
     "dev:dashboard": "cd dashboard && npm run dev",
     "dev:api": "node tests/test-complex.js",
     "dev": "node scripts/dev.js"
@@ -25,5 +27,11 @@
     "uuid": "^13.0.0",
     "ws": "^8.21.0",
     "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "autocannon": "^8.0.0",
+    "bullmq": "^6.3.6",
+    "testcontainers": "^12.0.4",
+    "vitest": "^5.0.1"
   }
 }

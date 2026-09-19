@@ -54,7 +54,6 @@ function patchWorker(WorkerClass, bus, options = {}) {
     patchConsole();
   }
   const origStart = WorkerClass.prototype.start;
-  const origWork  = WorkerClass.prototype.work;
 
   // ── Worker.start → worker.started + begin heartbeat/resource loops ───
   WorkerClass.prototype.start = async function(...args) {
@@ -113,11 +112,14 @@ function patchWorker(WorkerClass, bus, options = {}) {
       });
     }, 15_000);
 
-    return origStart.call(this, ...args);
-  };
-
-  // ── Worker.work inner job lifecycle → job.active, job.completed, job.failed ─
-  WorkerClass.prototype.work = async function(id, slotClient) {
+    // ── Handler lifecycle wrapper → job.active, job.completed, job.failed ──
+    // Installed at start: Phase 9 has no work() entry point — the single
+    // fetcher calls this.handler directly, so wrapping must happen here.
+    // Idempotent across restarts.
+    if (this.handler.__tmqPatched) {
+      return origStart.call(this, ...args);
+    }
+    this.handler.__tmqPatched = true;
     const origHandler = this.handler;
 
     // Wrap the user-provided handler to intercept start/end
@@ -292,8 +294,9 @@ function patchWorker(WorkerClass, bus, options = {}) {
       }
     };
 
-    return origWork.call(this, id, slotClient);
+    return origStart.call(this, ...args);
   };
+
 
   // ── Worker.stop (if implemented) → worker.stopped ────────────────────
   const origStop = WorkerClass.prototype.stop;

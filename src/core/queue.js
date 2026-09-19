@@ -1,12 +1,19 @@
 const { getRedisClient } = require("../utils/redis");
+const { createLogger } = require("../utils/logger");
 const Job = require("./job");
 const cron = require('cron-parser');
 const { v4: uuid } = require('uuid');
 
+const crypto = require('crypto');
+
 // Builds a stable, deterministic Redis-safe key for a repeatable job sequence.
-// Using base64 of the cron string avoids special characters (*/-, spaces) in keys.
-function repeatKey(queuename, cronExpr) {
-    return `repeat:${queuename}:${Buffer.from(cronExpr).toString('base64')}`;
+// NOTE: priority scoring lives in Lua (addJob/addBulk/promote/...) — the old
+// JS calcScore duplicate was deleted; do not reintroduce a second formula.
+// Uses sha1(name + cron) to prevent collision when two jobs share the same cron.
+// base64url avoids +/=/ characters that break URLs.
+function repeatKey(queuename, name, cronExpr) {
+    const hash = crypto.createHash('sha1').update(`${name}:${cronExpr}`).digest('hex').slice(0, 12);
+    return `repeat:${queuename}:${hash}`;
 }
 
 class Queue {
@@ -25,6 +32,7 @@ class Queue {
         this.schema = options.schema;
         this.connectionOpts = options.connection;
         this.client = getRedisClient(options.connection);
+        this.logger = createLogger(options);
     }
     async add(name, data, options = {}) {
         if (this.schema) {
@@ -35,87 +43,80 @@ class Queue {
         }
         const j = new Job(name, data, options);
 
-        // ── Deduplication: if jobId already exists in the jobs hash, bail out ──
-        if (options.jobId) {
-            const existing = await this.client.hexists(this.rediskeyjobs, j.id);
-            if (existing) {
-                return j.id; // idempotent — return the pre-existing id
-            }
-        }
-
         if (j.parent && j.parent.length > 0) {
-            // Store the job payload first
-            await this.client.hset(this.rediskeyjobs, j.id, j.toJson());
-            // Mark as blocked
-            await this.client.hset(this.rediskeyblocked, j.id, 1);
+            // Parent (blocked) path: atomic dedup + store + relationships via Lua
+            const result = await this.client.addJob(
+                this.rediskeyjobs, this.rediskey, this.rediskeysignal, this.rediskeyprioritized,
+                j.id, j.toJson(), j.priority || 0, j.timestamp,
+                'parent', this.prefix, this.queuename, j.parent.length
+            );
 
-            // Use a pipeline for all relationship writes to minimise round-trips
-            const pipeline = this.client.pipeline();
-            pipeline.set(`${this.prefix}:job:${j.id}:count`, j.parent.length);
-            pipeline.set(`${this.prefix}:job:${j.id}:name`, this.queuename);
-            for (let i = 0; i < j.parent.length; i++) {
-                pipeline.sadd(`${this.prefix}:dependent:${j.parent[i]}:children:`, j.id);
-                pipeline.sadd(`${this.prefix}:dependent:${j.id}:parent:`, j.parent[i]);
+            if (result === 0) {
+                await this.client.publish(`${this.prefix}:${this.queuename}:events`, JSON.stringify({ event: 'deduplicated', jobId: j.id }));
+                return { id: j.id, deduplicated: true };
             }
-            await pipeline.exec();
 
-            // ── DAG race-condition fix ──────────────────────────────────────────
+            // ── DAG race-condition fix (atomic Lua) ────────────────────────────
             // A parent may have already finished before we registered this child.
-            // Re-read the counter; if it has dropped to 0 or below (because unblock
-            // already fired for some parents) promote the job to waiting immediately.
-            const currentCount = await this.client.get(`${this.prefix}:job:${j.id}:count`);
-            if (parseInt(currentCount, 10) <= 0) {
-                await this.client.hdel(this.rediskeyblocked, j.id);
-                await this.client.del(`${this.prefix}:job:${j.id}:count`);
-                await this.client.del(`${this.prefix}:job:${j.id}:name`);
-                if (j.priority && j.priority > 0) {
-                    const score = j.priority * 100000000000 + (j.timestamp - 1700000000000);
-                    await this.client.zadd(this.rediskeyprioritized, score, j.id);
-                } else {
-                    await this.client.rpush(this.rediskey, j.id);
-                }
-                await this.client.lpush(this.rediskeysignal, 1);
-                await this.client.publish(`${this.prefix}:${this.queuename}:events`, JSON.stringify({ event: 'waiting', jobId: j.id }));
-            }
+            // promoteIfUnblocked.lua atomically checks the counter and promotes
+            // if all parents already completed — no JS+Redis race window.
+            await this.client.promoteIfUnblocked(
+                this.rediskeyblocked, this.rediskeyprioritized,
+                this.rediskey, this.rediskeysignal,
+                j.id, this.prefix, this.queuename,
+                j.priority || 0, j.timestamp,
+                `${this.prefix}:${this.queuename}:events`
+            );
 
-            return j.id;
+            return { id: j.id, deduplicated: false };
         }
         else if (j.repeat) {
             const interval = cron.CronExpressionParser.parse(j.repeat);
             const executetime = interval.next().getTime();
-            const stableId = repeatKey(this.queuename, j.repeat);
+            const stableId = repeatKey(this.queuename, j.name, j.repeat);
             j.id = stableId;
             j.timestamp = executetime;
-            await this.client.hset(this.rediskeyjobs, stableId, j.toJson());
-            const existsDelayed = await this.client.zscore(this.rediskeydelayed, stableId);
-            if (!existsDelayed) {
-                await this.client.signal(this.rediskeydelayed, this.rediskeysignaldelayed, executetime, stableId);
-                await this.client.publish(`${this.prefix}:${this.queuename}:events`, JSON.stringify({ event: 'delayed', jobId: stableId, delay: executetime - Date.now() }));
+            const result = await this.client.addDelayed(
+                this.rediskeyjobs, this.rediskeydelayed, this.rediskeysignaldelayed,
+                j.id, j.toJson(), executetime,
+                `${this.prefix}:${this.queuename}:events`
+            );
+            if (result === 0) {
+                await this.client.publish(`${this.prefix}:${this.queuename}:events`, JSON.stringify({ event: 'deduplicated', jobId: stableId }));
+                return { id: stableId, deduplicated: true };
             }
-            return stableId;
+            // Maintain repeatable SET index for O(1) reads
+            await this.client.sadd(`${this.prefix}:repeatable:${this.queuename}`, stableId);
+            return { id: stableId, deduplicated: false };
         }
         else if (j.delay) {
             const executetime = Date.now() + j.delay;
             j.timestamp = executetime;
-            await this.client.hset(this.rediskeyjobs, j.id, j.toJson());
-            await this.client.signal(this.rediskeydelayed, this.rediskeysignaldelayed, executetime, j.id);
-            await this.client.publish(`${this.prefix}:${this.queuename}:events`, JSON.stringify({ event: 'delayed', jobId: j.id, delay: j.delay }));
-            console.log(`Job ${j.id} scheduled for ${new Date(executetime).toLocaleTimeString()}`);
+            const result = await this.client.addDelayed(
+                this.rediskeyjobs, this.rediskeydelayed, this.rediskeysignaldelayed,
+                j.id, j.toJson(), executetime,
+                `${this.prefix}:${this.queuename}:events`
+            );
+            if (result === 0) {
+                await this.client.publish(`${this.prefix}:${this.queuename}:events`, JSON.stringify({ event: 'deduplicated', jobId: j.id }));
+                return { id: j.id, deduplicated: true };
+            }
+            return { id: j.id, deduplicated: false };
         }
         else {
-            await this.client.addJob(
-                this.rediskeyjobs,
-                this.rediskey,
-                this.rediskeysignal,
-                this.rediskeyprioritized,
-                j.id,
-                j.toJson(),
-                j.priority || 0,
-                j.timestamp
+            // Immediate path: atomic dedup via Lua
+            const result = await this.client.addJob(
+                this.rediskeyjobs, this.rediskey, this.rediskeysignal, this.rediskeyprioritized,
+                j.id, j.toJson(), j.priority || 0, j.timestamp,
+                'immediate'
             );
+            if (result === 0) {
+                await this.client.publish(`${this.prefix}:${this.queuename}:events`, JSON.stringify({ event: 'deduplicated', jobId: j.id }));
+                return { id: j.id, deduplicated: true };
+            }
             await this.client.publish(`${this.prefix}:${this.queuename}:events`, JSON.stringify({ event: 'waiting', jobId: j.id }));
+            return { id: j.id, deduplicated: false };
         }
-        return j.id;
     }
     async addBulk(jobsArray, options = {}) {
         const opt = { ...options };
@@ -128,72 +129,82 @@ class Queue {
             throw new Error(`Batch ID ${batchid} is already in use!`);
         }
 
-        const customIds = [];
+        // Flatten jobs into Lua args: [jobId, jobJson, priority, timestamp, mode, ...]
+        const luaArgs = [];
+        const signalJobs = []; // track delayed items that need signals after script
         for (const item of jobsArray) {
-            if (item.options) {
-                const itemOpt = { ...item.options };
-                if (itemOpt.jobId !== undefined) itemOpt.jobid = itemOpt.jobId;
-                if (itemOpt.jobid !== undefined) itemOpt.jobId = itemOpt.jobid;
-                if (itemOpt.jobId) {
-                    customIds.push(itemOpt.jobId);
-                }
+            const { name, data, options: itemOpts } = item;
+            const mergedOpts = { ...opt, ...itemOpts };
+            // Normalize jobId
+            if (mergedOpts.jobId !== undefined) mergedOpts.jobid = mergedOpts.jobId;
+            if (mergedOpts.jobid !== undefined) mergedOpts.jobId = mergedOpts.jobid;
+
+            const j = new Job(name, data, mergedOpts);
+            j.batchid = batchid;
+
+            let mode = 0; // 0=waiting (priority upgrades to prioritized), 2=delayed
+            let executetime = j.timestamp;
+
+            if (j.delay) {
+                mode = 2;
+                executetime = Date.now() + j.delay;
+                j.timestamp = executetime;
+                signalJobs.push({ id: j.id, executetime, delay: j.delay });
             }
+
+            luaArgs.push(
+                j.id,
+                j.toJson(),
+                j.priority || 0,
+                j.timestamp,
+                String(mode)
+            );
         }
 
-        const existingSet = new Set();
-        if (customIds.length > 0) {
-            const existingStatuses = await this.client.hmget(this.rediskeyjobs, ...customIds);
-            for (let i = 0; i < customIds.length; i++) {
-                if (existingStatuses[i] !== null && existingStatuses[i] !== undefined) {
-                    existingSet.add(customIds[i]);
-                }
-            }
-        }
-
-        const jobsToEnqueue = [];
-        for (const item of jobsArray) {
-            const itemOpt = item.options || {};
-            const jobId = itemOpt.jobId || itemOpt.jobid || null;
-            if (jobId && existingSet.has(jobId)) {
-                continue; // Skip pre-existing job
-            }
-            jobsToEnqueue.push(item);
-        }
-
-        if (jobsToEnqueue.length === 0) {
-            console.log("bulk: all jobs already exist. Nothing to enqueue.");
+        if (luaArgs.length === 0) {
             return batchid;
         }
 
-        const pipeline = this.client.pipeline();
-        pipeline.set(`${this.prefix}:batch:${batchid}:count`, jobsToEnqueue.length);
-        pipeline.expire(`${this.prefix}:batch:${batchid}:count`, 7 * 24 * 60 * 60);
-        for(let i=0;i<jobsToEnqueue.length;i++){
-            const { name, data, options: itemOpts } = jobsToEnqueue[i];
-            const j = new Job(name, data, itemOpts);
-            j.batchid = batchid;
-            pipeline.hset(this.rediskeyjobs,j.id,j.toJson());
-            if (j.priority && j.priority > 0) {
-                const score = j.priority * 100000000000 + (j.timestamp - 1700000000000);
-                pipeline.zadd(this.rediskeyprioritized, score, j.id);
-            } else {
-                pipeline.rpush(this.rediskey,j.id);
+        // Atomic bulk insert with per-item dedup via Lua.
+        // Keys: jobs, waiting, prioritized, batchcount, delayed.
+        const batchCountKey = `${this.prefix}:batch:${batchid}:count`;
+        const results = await this.client.addBulk(
+            this.rediskeyjobs, this.rediskey, this.rediskeyprioritized,
+            batchCountKey, this.rediskeydelayed,
+            luaArgs.length / 5, // batchSize
+            ...luaArgs
+        );
+
+        // Signal jobs that were actually created (result == 1)
+        let createdCount = 0;
+        for (let i = 0; i < results.length; i++) {
+            if (results[i] === 1) {
+                createdCount++;
+                const signalInfo = signalJobs.find(s => s.id === luaArgs[i * 5]);
+                if (signalInfo) {
+                    await this.client.lpush(this.rediskeysignaldelayed, signalInfo.executetime);
+                } else {
+                    // Waiting / prioritized: wake worker via signal list
+                    await this.client.lpush(this.rediskeysignal, 1);
+                }
             }
-            pipeline.lpush(this.rediskeysignal,1);
-            pipeline.publish(`${this.prefix}:${this.queuename}:events`, JSON.stringify({ event: 'waiting', jobId: j.id }));
         }
-        await pipeline.exec();
-        // console.log("bulk running successfully on",this.rediskey);
+
+        // If nothing was created (all duplicates), remove batch counter
+        if (createdCount === 0) {
+            await this.client.del(batchCountKey);
+        }
+
         return batchid;
     }
-    async addbulk(jobsarray, options = {}) {
-        return this.addBulk(jobsarray, options);
-    }
     async removeJob(jobId) {
+        // Return HDEL-style 0/1 (whether job existed), then queue cascading delete
+        const exists = await this.client.hexists(this.rediskeyjobs, jobId);
+        const dlqExists = exists ? 0 : await this.client.hexists(this.rediskeydlq, jobId);
+        if (!exists && !dlqExists) return 0;
         const task = { type: 'delete', jobId: jobId, queue: this.queuename };
         await this.client.rpush(`${this.prefix}:_internal:maintenance`, JSON.stringify(task));
-        console.log(`Task ${jobId} safely queued for background deletion.`);
-        return true;
+        return 1;
     }
     async retry(jobId){
         const jobjson = await this.client.hget(this.rediskeydlq,jobId);
@@ -203,9 +214,9 @@ class Queue {
         const job = JSON.parse(jobjson);
         job.status = "waiting";
         job.attempts = 0;
-        await this.client.retry(this.rediskeydlq, this.rediskey, this.rediskeysignal, this.rediskeyjobs, this.rediskeyprioritized, JSON.stringify(job), jobId);
+        await this.client.retry(this.rediskeydlq, this.rediskey, this.rediskeysignal, this.rediskeyjobs, this.rediskeyprioritized, `${this.prefix}:failed:${this.queuename}`, JSON.stringify(job), jobId);
         await this.client.publish(`${this.prefix}:${this.queuename}:events`, JSON.stringify({ event: 'waiting', jobId: jobId }));
-        console.log(`${jobId} is retrying..`);
+        this.logger.info(`${jobId} is retrying..`);
     }
     async pause() {
         await this.client.set(`${this.prefix}:paused:${this.queuename}`, '1');
@@ -233,43 +244,25 @@ class Queue {
     async clean(grace, limit, type = 'completed') {
         const now = Date.now();
         let cleanedCount = 0;
-        
         const zsetKey = `${this.prefix}:${type}:${this.queuename}`;
-        const jobIds = await this.client.zrange(zsetKey, 0, -1);
-        
-        if (jobIds.length === 0) return 0;
-        
-        const pipeline = this.client.pipeline();
-        for (const id of jobIds) {
-            pipeline.hget(this.rediskeyjobs, id);
-        }
-        const rawJobs = await pipeline.exec();
-        
-        const deletePipeline = this.client.pipeline();
-        for (let i = 0; i < jobIds.length; i++) {
-            if (cleanedCount >= limit) break;
-            const jobId = jobIds[i];
-            const jobJson = rawJobs[i][1];
-            if (jobJson) {
-                try {
-                    const job = JSON.parse(jobJson);
-                    if (now - job.timestamp > grace) {
-                        deletePipeline.hdel(this.rediskeyjobs, jobId);
-                        deletePipeline.zrem(zsetKey, jobId);
-                        deletePipeline.del(`${this.prefix}:logs:${this.queuename}:${jobId}`);
-                        cleanedCount++;
-                    }
-                } catch (err) {
-                    deletePipeline.hdel(this.rediskeyjobs, jobId);
-                    deletePipeline.zrem(zsetKey, jobId);
-                    deletePipeline.del(`${this.prefix}:logs:${this.queuename}:${jobId}`);
-                    cleanedCount++;
-                }
-            } else {
-                deletePipeline.zrem(zsetKey, jobId);
+        const cutoff = now - grace;
+
+        // Paginated scan: ZRANGEBYSCORE with LIMIT, compare ZSET score (finishedOn), not vault timestamp
+        while (cleanedCount < limit) {
+            const batch = await this.client.zrangebyscore(zsetKey, 0, cutoff, 'LIMIT', 0, Math.min(500, limit - cleanedCount));
+            if (batch.length === 0) break;
+
+            const pipeline = this.client.pipeline();
+            for (const id of batch) {
+                pipeline.hdel(this.rediskeyjobs, id);
+                pipeline.zrem(zsetKey, id);
+                pipeline.del(`${this.prefix}:logs:${this.queuename}:${id}`);
             }
+            await pipeline.exec();
+            cleanedCount += batch.length;
+
+            if (batch.length < 500) break;
         }
-        await deletePipeline.exec();
         return cleanedCount;
     }
     async obliterate() {
@@ -298,20 +291,52 @@ class Queue {
             `tmq:obs:cost:${this.queuename}:successfulJobCost`,
             `tmq:obs:cost:${this.queuename}:failedJobs`,
             `tmq:obs:cost:${this.queuename}:failedJobCost`,
+            `${this.prefix}:repeatable:${this.queuename}`,
+            `tmq:obs:events:${this.queuename}`,
+            `tmq:obs:incidents:${this.queuename}`,
+            `tmq:obs:alerts:${this.queuename}`,
+            `tmq:obs:alert_rules:${this.queuename}`,
         ];
         await this.client.del(...keys);
     }
     async getJob(jobId) {
         let json = await this.client.hget(this.rediskeyjobs, jobId);
+        // Check DLQ membership regardless of where json came from (dead jobs are in both)
+        const inDlq = json ? (await this.client.hexists(this.rediskeydlq, jobId)) : false;
+        let dlqJson = null;
         if (!json) {
-            json = await this.client.hget(this.rediskeydlq, jobId);
+            dlqJson = await this.client.hget(this.rediskeydlq, jobId);
+            if (dlqJson) { json = dlqJson; }
         }
+        const isDead = inDlq === 1 || !!dlqJson;
         const job = Job.fromJSON(json);
         if (job) {
             job.queue = this;
-            const isBlocked = await this.client.hexists(this.rediskeyblocked, jobId);
-            if (isBlocked) {
-                job.status = 'blocked';
+
+            // Derive status live from set membership (vault status is write-only hint)
+            if (isDead) {
+                job.status = 'dead';
+            } else {
+                const pipeline = this.client.pipeline();
+                pipeline.zscore(this.rediskeyactive, jobId);
+                pipeline.zscore(this.rediskeydelayed, jobId);
+                pipeline.zscore(`${this.prefix}:completed:${this.queuename}`, jobId);
+                pipeline.zscore(`${this.prefix}:failed:${this.queuename}`, jobId);
+                pipeline.hexists(this.rediskeyblocked, jobId);
+                const results = await pipeline.exec();
+
+                const isActive = results[0][1] !== null;
+                const isDelayed = results[1][1] !== null;
+                const isCompleted = results[2][1] !== null;
+                const isFailed = results[3][1] !== null;
+                const isBlocked = results[4][1];
+
+                if (isActive) job.status = 'active';
+                else if (isBlocked) job.status = 'blocked';
+                else if (isDelayed) job.status = 'delayed';
+                else if (isCompleted) job.status = 'completed';
+                else if (isFailed) job.status = 'failed';
+                // else: waiting (in list) — status stays as vault hint
             }
         }
         return job;
@@ -366,10 +391,22 @@ class Queue {
                 else if (type === 'blocked') {
                     key = this.rediskeyblocked;
                     isHash = true;
+                } else if (type === 'dead') {
+                    // Dead jobs live in the DLQ hash (previously fell through
+                    // with key='' and silently returned []).
+                    key = this.rediskeydlq;
+                    isHash = true;
                 }
 
                 if (isHash) {
-                    const allKeys = await this.client.hkeys(key);
+                    // HSCAN with cursor pagination instead of loading all keys
+                    let cursor = '0';
+                    const allKeys = [];
+                    do {
+                        const [newCursor, keys] = await this.client.hscan(key, cursor, 'MATCH', '*', 'COUNT', 100);
+                        cursor = newCursor;
+                        allKeys.push(...keys.filter((_, i) => i % 2 === 0)); // HSCAN returns [field, value, ...] pairs
+                    } while (cursor !== '0');
                     count = allKeys.length;
                     if (currentIndex <= requestedEnd && currentIndex + count > requestedStart) {
                         const localStart = Math.max(0, requestedStart - currentIndex);
@@ -403,25 +440,34 @@ class Queue {
             return [];
         }
 
+        // Skip DLQ/blocked lookups for completed/failed types (perf)
+        const needsDlq = types.includes('dead') || types.includes('blocked') || types.includes('active') || types.includes('waiting');
+        const needsBlocked = types.includes('blocked') || types.includes('active') || types.includes('waiting');
+
         const results = [];
         const pipeline = this.client.pipeline();
         for (const id of jobIds) {
             pipeline.hget(this.rediskeyjobs, id);
-            pipeline.hget(this.rediskeydlq, id);
-            pipeline.hexists(this.rediskeyblocked, id);
+            if (needsDlq) pipeline.hget(this.rediskeydlq, id);
+            if (needsBlocked) pipeline.hexists(this.rediskeyblocked, id);
         }
         const raw = await pipeline.exec();
 
+        const opsPerJob = 1 + (needsDlq ? 1 : 0) + (needsBlocked ? 1 : 0);
+
         for (let i = 0; i < jobIds.length; i++) {
-            const mainJson = raw[i * 3][1];
-            const dlqJson = raw[i * 3 + 1][1];
-            const isBlocked = raw[i * 3 + 2][1];
+            const mainJson = raw[i * opsPerJob][1];
+            const dlqJson = needsDlq ? raw[i * opsPerJob + 1][1] : null;
+            const isBlocked = needsBlocked ? raw[i * opsPerJob + (needsDlq ? 2 : 1)][1] : false;
             const json = mainJson || dlqJson;
             if (json) {
                 const j = Job.fromJSON(json);
                 if (j) {
                     j.queue = this;
-                    if (isBlocked) {
+                    // Precedence: dead > blocked > active > waiting
+                    if (dlqJson && !mainJson) {
+                        j.status = 'dead';
+                    } else if (isBlocked) {
                         j.status = 'blocked';
                     }
                     results.push(j);
@@ -483,26 +529,15 @@ class Queue {
 
         return counts;
     }
-    async updateJob(jobId, data) {
-        const job = await this.getJob(jobId);
-        if (job) {
-            await job.update(data);
-            return job;
-        }
-        return null;
-    }
-    async changeJobDelay(jobId, delay) {
-        const job = await this.getJob(jobId);
-        if (job) {
-            await job.changeDelay(delay);
-            return job;
-        }
-        return null;
-    }
     async removeRepeatable(repeatKeyOrCron) {
         let stableId = repeatKeyOrCron;
         if (!repeatKeyOrCron.startsWith('repeat:')) {
-            stableId = repeatKey(this.queuename, repeatKeyOrCron);
+            // repeatKeyOrCron is cron expression: need job name to compute stable id
+            // Try to find matching repeatable job by cron
+            const all = await this.getRepeatableJobs();
+            const match = all.find(j => j.cron === repeatKeyOrCron);
+            if (match) stableId = match.key;
+            else stableId = repeatKey(this.queuename, 'default', repeatKeyOrCron);
         }
         
         const pipeline = this.client.pipeline();
@@ -510,12 +545,12 @@ class Queue {
         pipeline.zrem(this.rediskeydelayed, stableId);
         pipeline.zrem(this.rediskeyactive, stableId);
         pipeline.lrem(this.rediskey, 0, stableId);
+        pipeline.srem(`${this.prefix}:repeatable:${this.queuename}`, stableId);
         
         await pipeline.exec();
     }
     async getRepeatableJobs() {
-        const allJobs = await this.client.hgetall(this.rediskeyjobs);
-        const repeatableIds = Object.keys(allJobs).filter(key => key.startsWith(`repeat:${this.queuename}:`));
+        const repeatableIds = await this.client.smembers(`${this.prefix}:repeatable:${this.queuename}`);
         
         if (repeatableIds.length === 0) {
             return [];
@@ -523,25 +558,29 @@ class Queue {
         
         const pipeline = this.client.pipeline();
         for (const id of repeatableIds) {
+            pipeline.hget(this.rediskeyjobs, id);
             pipeline.zscore(this.rediskeydelayed, id);
         }
-        const scores = await pipeline.exec();
+        const results = await pipeline.exec();
         
-        const results = [];
+        const output = [];
         for (let i = 0; i < repeatableIds.length; i++) {
             const id = repeatableIds[i];
-            const scoreVal = scores[i][1];
-            try {
-                const job = JSON.parse(allJobs[id]);
-                results.push({
-                    key: id,
-                    name: job.name,
-                    cron: job.repeat,
-                    next: scoreVal ? parseInt(scoreVal, 10) : null
-                });
-            } catch (_) {}
+            const jobJson = results[i * 2][1];
+            const scoreVal = results[i * 2 + 1][1];
+            if (jobJson) {
+                try {
+                    const job = JSON.parse(jobJson);
+                    output.push({
+                        key: id,
+                        name: job.name,
+                        cron: job.repeat,
+                        next: scoreVal ? parseInt(scoreVal, 10) : null
+                    });
+                } catch (_) {}
+            }
         }
-        return results;
+        return output;
     }
     async close() {
         if (this.client) {

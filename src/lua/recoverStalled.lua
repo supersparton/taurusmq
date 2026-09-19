@@ -5,8 +5,15 @@
 -- KEYS[4] = prioritized ZSET    e.g. taurusmq:prioritized:myqueue
 -- KEYS[5] = jobs hash           e.g. taurusmq:jobs:myqueue
 -- KEYS[6] = DLQ hash            e.g. taurusmq:dlq:myqueue
--- ARGV[1] = now
--- ARGV[2] = timeout (unused now, but kept for compatibility)
+-- ARGV[1] = now (timestamp ms)
+
+-- Score constants (freeze — changing invalidates existing scores)
+local PRIORITY_SCALE = 100000000000   -- 1e11
+local EPOCH_BASE = 1700000000000      -- 2023-11-14T22:13:20Z
+
+local function calcScore(priority, timestamp)
+    return priority * PRIORITY_SCALE + (timestamp - EPOCH_BASE)
+end
 
 local now = tonumber(ARGV[1])
 
@@ -54,7 +61,7 @@ for _, jobId in ipairs(stalledJobIds) do
             end
             
             if hasPriority then
-                local score = priorityVal * 100000000000 + (tonumber(job.timestamp or 0) - 1700000000000)
+                local score = calcScore(priorityVal, tonumber(job.timestamp or 0))
                 redis.call('ZADD', KEYS[4], score, jobId)
             else
                 redis.call('RPUSH', KEYS[2], jobId)

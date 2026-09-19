@@ -1,4 +1,5 @@
 const { getRedisClient } = require("../utils/redis");
+const { createLogger } = require("../utils/logger");
 
 class Maintenance {
     constructor(options = {}) {
@@ -10,6 +11,7 @@ class Maintenance {
         this.connectionOpts = options.connection;
         this.redisClient = getRedisClient(this.connectionOpts);
         this.client = getRedisClient(this.connectionOpts, true);
+        this.logger = createLogger(options);
 
         this.maintenanceTimer = null;
         this.maintenanceResolve = null;
@@ -18,7 +20,7 @@ class Maintenance {
     }
 
     async start() {
-        console.log(`🧹 TaurusMQ Maintenance Engine started.`);
+        this.logger.info(`TaurusMQ Maintenance Engine started.`);
         
         // Run background workers without blocking
         this.runMaintenanceLoop();
@@ -68,7 +70,7 @@ class Maintenance {
                     }
                 }
             } catch (err) {
-                console.error("Maintenance loop error:", err.message);
+                this.logger.error("Maintenance loop error:", err.message);
                 if (this.active) {
                     await new Promise(r => {
                         this.maintenanceResolve = r;
@@ -93,6 +95,16 @@ class Maintenance {
             const currentId = queue.shift();
             idsToDelete.push(currentId);
 
+            // SREM this job from its parent's children set (fix orphan refs)
+            const parentIds = await this.redisClient.smembers(`${this.prefix}:dependent:${currentId}:parent:`);
+            if (parentIds && parentIds.length > 0) {
+                const pipeline = this.redisClient.pipeline();
+                for (const parentId of parentIds) {
+                    pipeline.srem(`${this.prefix}:dependent:${parentId}:children:`, currentId);
+                }
+                await pipeline.exec();
+            }
+
             const children = await this.redisClient.smembers(`${this.prefix}:dependent:${currentId}:children:`);
             if (children && children.length > 0) {
                 for (const childId of children) {
@@ -104,34 +116,47 @@ class Maintenance {
             }
         }
 
+        // Resolve per-job queue names up front (single pipeline — the old
+        // code awaited one GET per job while building the delete pipeline)
+        const namePipe = this.redisClient.pipeline();
+        for (const id of idsToDelete) {
+            namePipe.get(`${this.prefix}:job:${id}:name`);
+        }
+        const nameResults = await namePipe.exec();
+        const queueOf = (id, i) => (nameResults?.[i]?.[1]) || queueName;
+
         // Delete all found jobs atomically using a Pipeline
         const pipeline = this.redisClient.pipeline();
-        
-        for (const id of idsToDelete) {
+
+        for (let idx = 0; idx < idsToDelete.length; idx++) {
+            const id = idsToDelete[idx];
+            // Resolve per-job queue for each job (multi-queue DAG fix)
+            const jobQueueName = queueOf(id, idx);
+
             // A. Clean up Dependencies & Tracking
             pipeline.del(`${this.prefix}:dependent:${id}:children:`);
             pipeline.del(`${this.prefix}:dependent:${id}:parent:`);
             pipeline.del(`${this.prefix}:job:${id}:count`);
             pipeline.del(`${this.prefix}:job:${id}:name`);
-            
-            // B. Remove from ALL queue states
-            pipeline.lrem(`${this.prefix}:${queueName}`, 0, id); 
-            pipeline.zrem(`${this.prefix}:delayed:${queueName}`, id);
-            pipeline.zrem(`${this.prefix}:active:${queueName}`, id);
-            pipeline.zrem(`${this.prefix}:completed:${queueName}`, id);
-            pipeline.zrem(`${this.prefix}:failed:${queueName}`, id);
-            pipeline.hdel(`${this.prefix}:dlq:${queueName}`, id);
-            pipeline.hdel(`${this.prefix}:blocked:${queueName}`, id);
-            
+
+            // B. Remove from ALL queue states (using per-job queue name)
+            pipeline.lrem(`${this.prefix}:${jobQueueName}`, 0, id);
+            pipeline.zrem(`${this.prefix}:delayed:${jobQueueName}`, id);
+            pipeline.zrem(`${this.prefix}:active:${jobQueueName}`, id);
+            pipeline.zrem(`${this.prefix}:completed:${jobQueueName}`, id);
+            pipeline.zrem(`${this.prefix}:failed:${jobQueueName}`, id);
+            pipeline.hdel(`${this.prefix}:dlq:${jobQueueName}`, id);
+            pipeline.hdel(`${this.prefix}:blocked:${jobQueueName}`, id);
+
             // C. Remove the actual payload from the Job Vault
-            pipeline.hdel(`${this.prefix}:jobs:${queueName}`, id);
-            
+            pipeline.hdel(`${this.prefix}:jobs:${jobQueueName}`, id);
+
             // D. Publish removed event to pubsub channel
-            pipeline.publish(`${this.prefix}:${queueName}:events`, JSON.stringify({ event: 'removed', jobId: id }));
+            pipeline.publish(`${this.prefix}:${jobQueueName}:events`, JSON.stringify({ event: 'removed', jobId: id }));
         }
 
         await pipeline.exec();
-        console.log(`🧹 Maintenance: Purged ${idsToDelete.length} jobs (including dependencies) starting from ${startJobId}`);
+        this.logger.info(`Maintenance: Purged ${idsToDelete.length} jobs (including dependencies) starting from ${startJobId}`);
     }
 
     // 2. Zombie Watchdog
@@ -146,22 +171,28 @@ class Maintenance {
 
                     for (const activeKey of keys) {
                         const queueName = activeKey.replace(`${this.prefix}:active:`, '');
-                        const activeJobs = await this.redisClient.zrange(activeKey, 0, -1);
-                        
+                        const activeJobs = await this.redisClient.zrange(activeKey, 0, -1, 'WITHSCORES');
+
                         const now = Date.now();
-                        for (const jobId of activeJobs) {
+                        for (let i = 0; i < activeJobs.length; i += 2) {
+                            const jobId = activeJobs[i];
+                            const leaseExpiry = parseInt(activeJobs[i + 1], 10);
+
+                            // Skip jobs with a valid lease (has an owner)
+                            if (leaseExpiry > now) continue;
+
                             const jobJson = await this.redisClient.hget(`${this.prefix}:jobs:${queueName}`, jobId);
-                            
+
                             if (jobJson) {
                                 const job = JSON.parse(jobJson);
-                                
+
                                 // If the job has been actively processing for more than zombieTimeout.
                                 const activeStartTime = job.processedOn || job.timestamp;
                                 if (now - activeStartTime > this.zombieTimeout) {
-                                    console.log(`🧟 Zombie detected! Job ${jobId} in ${queueName} exceeded timeout. Moving to DLQ.`);
+                                    this.logger.info(`Zombie detected! Job ${jobId} in ${queueName} exceeded timeout. Moving to DLQ.`);
                                     job.status = 'dead';
-                                    job.error = 'Zombie timeout exceeded. Worker probably crashed.';
-                                    
+                                    job.failedReason = 'Zombie timeout exceeded. Worker probably crashed.';
+
                                     const pipeline = this.redisClient.pipeline();
                                     pipeline.hset(`${this.prefix}:jobs:${queueName}`, jobId, JSON.stringify(job)); // Update vault
                                     pipeline.hset(`${this.prefix}:dlq:${queueName}`, jobId, JSON.stringify(job)); // Store in DLQ
@@ -171,15 +202,15 @@ class Maintenance {
                                 }
                             } else {
                                 // Data is gone from vault, but it's stuck in active ZSET
-                                console.log(`🧹 Maintenance: Removing ghost job ${jobId} from active state.`);
+                                this.logger.info(`Maintenance: Removing ghost job ${jobId} from active state.`);
                                 await this.redisClient.zrem(activeKey, jobId);
                             }
                         }
                     }
                 } while (cursor !== '0');
-                
+
             } catch(err) {
-                console.error("Zombie watchdog error:", err.message);
+                this.logger.error("Zombie watchdog error:", err.message);
             }
             
             // Sleep for the interval before checking again

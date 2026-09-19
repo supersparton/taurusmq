@@ -143,7 +143,6 @@ class MetricsAggregator {
       'p99LatencyMs',        String(p99),
       'netGrowthRate',       String(Math.round(netGrowthRate * 100) / 100),
       'healthScore',         String(healthScore),
-      'samplesCount',        String(samples.length),
       'updatedAt',           String(now),
     );
 

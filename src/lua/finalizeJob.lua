@@ -12,6 +12,7 @@
 -- ARGV[7] = removeOnFail      (number of failed jobs to retain, 0 for infinite)
 -- ARGV[8] = prefix            (e.g. 'taurusmq')
 -- ARGV[9] = queueName         (e.g. 'myqueue')
+-- ARGV[10] = publishEvents    ('1' publish, '0' skip; omitted/nil = publish)
 
 local jobId = ARGV[1]
 local status = ARGV[2]
@@ -75,45 +76,61 @@ if status == 'completed' then
         if total > removeOnComplete then
             local toRemove = redis.call('ZRANGE', KEYS[3], 0, total - removeOnComplete - 1)
             for _, id in ipairs(toRemove) do
-                redis.call('HDEL', KEYS[1], id)
-                redis.call('DEL', prefix .. ':logs:' .. queueName .. ':' .. id)
-                redis.call('ZREM', KEYS[3], id)
+                -- Eviction guard: skip jobs referenced by DAG (has count or children)
+                local hasCount = redis.call('EXISTS', prefix .. ':job:' .. id .. ':count') == 1
+                local hasChildren = redis.call('EXISTS', prefix .. ':dependent:' .. id .. ':children:') == 1
+                if not hasCount and not hasChildren then
+                    redis.call('HDEL', KEYS[1], id)
+                    redis.call('DEL', prefix .. ':logs:' .. queueName .. ':' .. id)
+                    redis.call('ZREM', KEYS[3], id)
+                end
             end
         end
     end
 else
     redis.call('ZADD', KEYS[4], nowMs, jobId)
-    
+
     if removeOnFail > 0 then
         local total = redis.call('ZCARD', KEYS[4])
         if total > removeOnFail then
             local toRemove = redis.call('ZRANGE', KEYS[4], 0, total - removeOnFail - 1)
             for _, id in ipairs(toRemove) do
-                redis.call('HDEL', KEYS[1], id)
-                redis.call('DEL', prefix .. ':logs:' .. queueName .. ':' .. id)
-                redis.call('ZREM', KEYS[4], id)
+                -- Eviction guard: skip jobs referenced by DAG (has count or children)
+                local hasCount = redis.call('EXISTS', prefix .. ':job:' .. id .. ':count') == 1
+                local hasChildren = redis.call('EXISTS', prefix .. ':dependent:' .. id .. ':children:') == 1
+                if not hasCount and not hasChildren then
+                    redis.call('HDEL', KEYS[1], id)
+                    redis.call('DEL', prefix .. ':logs:' .. queueName .. ':' .. id)
+                    redis.call('ZREM', KEYS[4], id)
+                    -- DLQ eviction: also remove from DLQ hash
+                    redis.call('HDEL', prefix .. ':dlq:' .. queueName, id)
+                end
             end
         end
     end
 end
 
--- 4. Publish completed/failed event to channel
-local eventsChannel = prefix .. ':' .. queueName .. ':events'
-if status == 'completed' then
-    local returnvalue = nil
-    if returnOrFailedVal and returnOrFailedVal ~= "" then
-        local ok, decoded = pcall(cjson.decode, returnOrFailedVal)
-        if ok then
-            returnvalue = decoded
-        else
-            returnvalue = returnOrFailedVal
+-- 4. Publish completed/failed event to channel (skipped for
+-- publishEvents=false workers — QueueEvents subscribers are the only
+-- consumers, and obs feeds off local hooks instead)
+if ARGV[10] == nil or ARGV[10] ~= '0' then
+    local eventsChannel = prefix .. ':' .. queueName .. ':events'
+    if status == 'completed' then
+        local returnvalue = nil
+        if returnOrFailedVal and returnOrFailedVal ~= "" then
+            local ok, decoded = pcall(cjson.decode, returnOrFailedVal)
+            if ok then
+                returnvalue = decoded
+            else
+                returnvalue = returnOrFailedVal
+            end
         end
+        local eventPayload = cjson.encode({ event = 'completed', jobId = jobId, returnvalue = returnvalue })
+        redis.call('PUBLISH', eventsChannel, eventPayload)
+    else
+        local eventPayload = cjson.encode({ event = 'failed', jobId = jobId, failedReason = returnOrFailedVal })
+        redis.call('PUBLISH', eventsChannel, eventPayload)
     end
-    local eventPayload = cjson.encode({ event = 'completed', jobId = jobId, returnvalue = returnvalue })
-    redis.call('PUBLISH', eventsChannel, eventPayload)
-else
-    local eventPayload = cjson.encode({ event = 'failed', jobId = jobId, failedReason = returnOrFailedVal })
-    redis.call('PUBLISH', eventsChannel, eventPayload)
 end
 
 return 1

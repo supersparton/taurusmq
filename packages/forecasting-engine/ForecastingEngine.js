@@ -112,14 +112,6 @@ class ForecastingEngine {
     };
   }
 
-  /**
-   * Forecast all known queues in parallel.
-   * @param {string[]} queueNames
-   */
-  async forecastAll(queueNames, opts = {}) {
-    return Promise.all(queueNames.map(q => this.forecastQueue(q, opts)));
-  }
-
   // ── Helpers ──────────────────────────────────────────────────────────
 
   async _countActiveWorkers(queueName) {

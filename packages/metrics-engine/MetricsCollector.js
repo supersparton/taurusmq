@@ -52,14 +52,12 @@ class MetricsCollector {
     b.on(EventType.JOB_DELAYED,   (e) => this._onJobDelayed(e));
     b.on(EventType.JOB_RETRY,     (e) => this._onJobRetry(e));
     b.on(EventType.JOB_PROMOTED,  (e) => this._onJobPromoted(e));
-    b.on(EventType.JOB_REMOVED,   (e) => this._onJobRemoved(e));
 
     // ── Worker events ─────────────────────────────────────────────────
     b.on(EventType.WORKER_STARTED,   (e) => this._onWorkerStarted(e));
     b.on(EventType.WORKER_HEARTBEAT, (e) => this._onWorkerHeartbeat(e));
     b.on(EventType.WORKER_MEMORY,    (e) => this._onWorkerMemory(e));
     b.on(EventType.WORKER_CPU,       (e) => this._onWorkerCpu(e));
-    b.on(EventType.WORKER_STALLED,   (e) => this._onWorkerStalled(e));
     b.on(EventType.WORKER_STOPPED,   (e) => this._onWorkerStopped(e));
 
     console.log('[obs] MetricsCollector started');
@@ -172,10 +170,6 @@ class MetricsCollector {
     await pipe.exec();
   }
 
-  async _onJobRemoved({ queueName }) {
-    await this._decr(queueName, 'waiting');
-  }
-
   // ─────────────────────────────────────────────────────────────────────
   // Worker handlers
   // ─────────────────────────────────────────────────────────────────────
@@ -226,12 +220,6 @@ class MetricsCollector {
       .exec();
   }
 
-  async _onWorkerStalled({ workerId }) {
-    const stateKey = `tmq:obs:worker:${workerId}:state`;
-    await redis.hset(stateKey, 'state', 'stalled');
-    // Don't reset TTL — let it expire naturally if truly dead
-  }
-
   async _onWorkerStopped({ workerId }) {
     const stateKey = `tmq:obs:worker:${workerId}:state`;
     await redis.hset(stateKey, 'state', 'stopped', 'stoppedAt', String(Date.now()));
@@ -248,12 +236,6 @@ class MetricsCollector {
   async _incr(queueName, field) {
     await redis.hincrby(this._ckey(queueName), field, 1);
   }
-  async _decr(queueName, field) {
-    const pipe = redis.pipeline();
-    this._pipeDecr(pipe, this._ckey(queueName), field);
-    await pipe.exec();
-  }
-
   _pipeDecr(pipe, key, field) {
     pipe.eval("local c=redis.call('HGET',KEYS[1],ARGV[1]); if c and tonumber(c)>0 then return redis.call('HINCRBY',KEYS[1],ARGV[1],-1) else redis.call('HSET',KEYS[1],ARGV[1],0); return 0 end", 1, key, field);
     return pipe;

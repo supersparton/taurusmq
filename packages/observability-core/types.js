@@ -8,12 +8,13 @@
  * All event types emitted by the TaurusMQ runtime.
  * These are the only valid values for ObsEvent.type.
  */
+// NOTE: only event types with at least one bus.emit() call site live here.
+// Removed as dead: QUEUE_CREATED, QUEUE_CLEANED, JOB_REMOVED, WORKER_STALLED,
+// FLOW_STARTED, FLOW_NODE_COMPLETED, FLOW_NODE_FAILED, FLOW_COMPLETED.
 const EventType = Object.freeze({
   // Queue lifecycle
-  QUEUE_CREATED:  'queue.created',
   QUEUE_PAUSED:   'queue.paused',
   QUEUE_RESUMED:  'queue.resumed',
-  QUEUE_CLEANED:  'queue.cleaned',
 
   // Job lifecycle
   JOB_CREATED:    'job.created',
@@ -23,22 +24,14 @@ const EventType = Object.freeze({
   JOB_FAILED:     'job.failed',
   JOB_RETRY:      'job.retry',
   JOB_DELAYED:    'job.delayed',
-  JOB_REMOVED:    'job.removed',
   JOB_PROMOTED:   'job.promoted',
 
   // Worker lifecycle
   WORKER_STARTED:    'worker.started',
   WORKER_STOPPED:    'worker.stopped',
-  WORKER_STALLED:    'worker.stalled',
   WORKER_HEARTBEAT:  'worker.heartbeat',
   WORKER_MEMORY:     'worker.memory',
   WORKER_CPU:        'worker.cpu',
-
-  // Flow (DAG) lifecycle
-  FLOW_STARTED:        'flow.started',
-  FLOW_NODE_COMPLETED: 'flow.node.completed',
-  FLOW_NODE_FAILED:    'flow.node.failed',
-  FLOW_COMPLETED:      'flow.completed',
 
   // Alert lifecycle
   ALERT_FIRED:    'alert.fired',
@@ -134,23 +127,6 @@ const EventType = Object.freeze({
  *   workerId:    string,
  *   activeJobs:  string[],  // job IDs currently being processed
  * }} WorkerHeartbeatEvent
- */
-
-/**
- * @typedef {BaseEvent & {
- *   workerId:    string,
- *   lastSeenMs:  number,    // ms since last heartbeat
- *   orphanedJobIds: string[],
- * }} WorkerStalledEvent
- */
-
-/**
- * @typedef {BaseEvent & {
- *   flowId:   string,
- *   nodeId:   string,
- *   nodeName: string,
- *   durationMs: number,
- * }} FlowNodeCompletedEvent
  */
 
 /**

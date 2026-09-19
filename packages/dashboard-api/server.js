@@ -15,8 +15,6 @@
 //   GET  /api/incidents                         — firing + history
 //   GET  /api/incidents/:id/rca                 — RCA hypotheses
 //   GET  /api/recommendations                   — ranked recommendations
-//   GET  /api/forecast                          — capacity forecasts
-//   GET  /api/cost                              — cost summary per queue
 //   GET  /api/events?from=<ms>&to=<ms>          — event stream history
 //   POST /api/queues/:name/actions/pause-retries
 //   WS   /ws                                    — live update stream
@@ -105,6 +103,14 @@ const server = http.createServer(async (req, res) => {
       return json(res, metrics);
     }
 
+    // ── GET /api/queues/dependencies ───────────────────────────────────────
+    // NOTE: must precede the :name route below — otherwise "dependencies"
+    // matches /^\/api\/queues\/([^/]+)$/ and is treated as a queue name.
+    if (req.method === 'GET' && path === '/api/queues/dependencies') {
+      const deps = await inferQueueDependencies();
+      return json(res, deps);
+    }
+
     // ── GET /api/queues/:name ─────────────────────────────────────────────
     const queueMatch = path.match(/^\/api\/queues\/([^/]+)$/);
     if (req.method === 'GET' && queueMatch) {
@@ -185,12 +191,6 @@ const server = http.createServer(async (req, res) => {
         }
       }
       return json(res, list);
-    }
-
-    // ── GET /api/queues/dependencies ───────────────────────────────────────
-    if (req.method === 'GET' && path === '/api/queues/dependencies') {
-      const deps = await inferQueueDependencies();
-      return json(res, deps);
     }
 
     // ── GET /api/incidents ────────────────────────────────────────────────
@@ -322,12 +322,6 @@ const server = http.createServer(async (req, res) => {
       }));
 
       return json(res, { ok: true });
-    }
-
-    // ── GET /api/forecast ─────────────────────────────────────────────────
-    if (req.method === 'GET' && path === '/api/forecast') {
-      const names = await discoverQueues();
-      return json(res, await _forecasting.forecastAll(names));
     }
 
     // ── GET /api/queues/:name/analytics ──────────────────────────────────

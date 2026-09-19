@@ -26,10 +26,10 @@ const COOKIE_NAME  = 'tmq_token';
 const JWT_EXPIRES  = '24h';
 
 // Public routes — no token required
+// (OPTIONS preflights are answered early in server.js before auth runs.)
 const PUBLIC_ROUTES = new Set([
   'POST /api/auth/login',
   'GET /api/auth/me',       // returns null if not logged in (used by UI to check state)
-  'OPTIONS /',
 ]);
 
 /**
@@ -88,7 +88,10 @@ function createAuth(setup, jwtSecret, allowedOrigins = []) {
     const limitKey = `taurusmq:obs:ratelimit:login:${ip}`;
     const now = Date.now();
     try {
-      const [allowed, waitTime] = await redis.rateLimit(limitKey, now, 60000, 5); // 5 attempts per minute
+      // Unique member per attempt: same-ms logins must not collapse into one
+      // ZSET member (see rateLimit.lua ARGV[4]).
+      const attemptId = `${now}:${Math.random().toString(36).slice(2)}`;
+      const [allowed, waitTime] = await redis.rateLimit(limitKey, now, 60000, 5, attemptId); // 5 attempts per minute
       if (allowed === 0) {
         res.writeHead(429, { 
           'Content-Type': 'application/json',
