@@ -36,7 +36,7 @@ function HealthRing({ score, size = 72 }: { score: number; size?: number }) {
 
 const STATE_TABS: JobState[] = ['active', 'waiting', 'delayed', 'failed', 'completed'];
 
-import { getQueue, getQueueJobs, retryFailedJobs, cleanQueue, pauseRetries, retryJob, getWorkers, getQueueAnalytics, getRecommendations, getIncidents, getQueueDependencies } from '@/lib/api';
+import { getQueue, getQueueJobs, retryFailedJobs, cleanQueue, pauseRetries, retryJob, getWorkers, getQueueAnalytics, getIncidents, getQueueDependencies, getQueueErrors } from '@/lib/api';
 import { isFeatureEnabled } from '@/lib/features';
 
 export default function QueueDetailPage({ params }: { params: any }) {
@@ -55,8 +55,8 @@ export default function QueueDetailPage({ params }: { params: any }) {
   const [timeRange, setTimeRange] = useState('Last 24h');
   const [refreshInterval, setRefreshInterval] = useState('5s');
 
-  // Real intelligence telemetry states
-  const [recommendations, setRecommendations] = useState<any[]>([]);
+  // Telemetry states
+  const [errorGroups, setErrorGroups] = useState<{ message: string; count: number }[]>([]);
   const [incidents, setIncidents] = useState<{ firing: any[]; history: any[] }>({ firing: [], history: [] });
   const [dependencies, setDependencies] = useState<any[]>([]);
   const [currentPage, setCurrentPage] = useState(1);
@@ -69,14 +69,14 @@ export default function QueueDetailPage({ params }: { params: any }) {
   const loadData = async (currentRange = timeRange) => {
     try {
       const apiRange = currentRange === 'Last 7d' ? '7d' : currentRange === 'Last 24h' ? '24h' : '1h';
-      const [queueData, rawJobs, rawWorkers, analyticsData, rawRecommendations, rawIncidents, rawDeps] = await Promise.all([
+      const [queueData, rawJobs, rawWorkers, analyticsData, rawIncidents, rawDeps, rawErrors] = await Promise.all([
         getQueue(name),
         getQueueJobs(name),
         getWorkers(),
         getQueueAnalytics(name, apiRange),
-        getRecommendations().catch(() => []),
         getIncidents().catch(() => ({ firing: [], history: [] })),
-        getQueueDependencies().catch(() => [])
+        getQueueDependencies().catch(() => []),
+        getQueueErrors(name).catch(() => [])
       ]);
       
       if (queueData) {
@@ -128,11 +128,11 @@ export default function QueueDetailPage({ params }: { params: any }) {
       if (analyticsData) {
         setAnalytics(analyticsData);
       }
-      if (rawRecommendations) {
-        setRecommendations(rawRecommendations);
-      }
       if (rawIncidents) {
         setIncidents(rawIncidents);
+      }
+      if (Array.isArray(rawErrors)) {
+        setErrorGroups(rawErrors);
       }
       if (rawDeps && Array.isArray(rawDeps)) {
         setDependencies(rawDeps);
@@ -741,6 +741,35 @@ export default function QueueDetailPage({ params }: { params: any }) {
                   Next
                 </button>
               </div>
+            </div>
+          )}
+        </div>
+
+        {/* Error groups (all-time, server-side aggregation) */}
+        <div className="panel">
+          <div className="panel-header">
+            <span className="panel-title">Top errors</span>
+            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+              {errorGroups.length === 0 ? 'no recorded failures' : `${errorGroups.length} groups`}
+            </span>
+          </div>
+          {errorGroups.length === 0 ? (
+            <div style={{ padding: '14px', fontSize: 11.5, color: 'var(--text-muted)' }}>
+              No error groups recorded for this queue yet.
+            </div>
+          ) : (
+            <div style={{ overflowX: 'auto', maxHeight: 220, overflowY: 'auto' }}>
+              <table className="data-table">
+                <thead><tr><th>Error message</th><th>Count</th></tr></thead>
+                <tbody>
+                  {errorGroups.map(group => (
+                    <tr key={group.message}>
+                      <td style={{ fontFamily: 'var(--font-mono)', fontSize: 11.5 }}>{group.message}</td>
+                      <td style={{ fontVariantNumeric: 'tabular-nums', fontWeight: 700, color: '#ef4444' }}>{group.count}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
           )}
         </div>

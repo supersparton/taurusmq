@@ -22,6 +22,9 @@ class Scheduler {
         this.rediskeysignaldelayed = `${this.prefix}:signal:delayed:${queuename}`;
         this.rediskeyblocked = `${this.prefix}:blocked:${queuename}`;
         this.active = true;
+        // Watchdog sweep interval (also honors legacy positional timeout).
+        // Default 50s; tests pass { timeout: 200 } for fast stall recovery.
+        this.sweepInterval = time;
 
         this.connectionOpts = opts.connection;
         this.redisClient = getRedisClient(this.connectionOpts);
@@ -61,7 +64,7 @@ class Scheduler {
                         resolve();
                         this.watchdogResolve = null;
                         this.watchdogTimer = null;
-                    }, 60000);
+                    }, this.sweepInterval);
                 });
             }
         }

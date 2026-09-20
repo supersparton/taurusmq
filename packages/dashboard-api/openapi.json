@@ -1,0 +1,282 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "TaurusMQ Dashboard API",
+    "version": "1.0.0",
+    "description": "REST gateway for the TaurusMQ observability dashboard. Auth is a signed JWT in the httpOnly `tmq_token` cookie (login first, the browser sends it automatically). Shapes below mirror the implementation in server.js — spec follows code."
+  },
+  "servers": [{ "url": "/", "description": "Same-origin (dashboard proxies /api/* here)" }],
+  "tags": [
+    { "name": "auth", "description": "Session management" },
+    { "name": "queues", "description": "Queue metrics and actions" },
+    { "name": "jobs", "description": "Job inspection and control" },
+    { "name": "workers", "description": "Worker state" },
+    { "name": "incidents", "description": "Firing incidents and history" },
+    { "name": "alerts", "description": "Alert rule CRUD" },
+    { "name": "analytics", "description": "Aggregates, events, flows, settings" }
+  ],
+  "paths": {
+    "/api/auth/login": {
+      "post": {
+        "tags": ["auth"],
+        "summary": "Log in, sets tmq_token cookie",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["username", "password"], "properties": { "username": { "type": "string" }, "password": { "type": "string" } } } } } },
+        "responses": { "200": { "description": "Logged in", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" } } } } } }, "401": { "description": "Bad credentials" }, "429": { "description": "Rate limited (5/min per IP)" } }
+      }
+    },
+    "/api/auth/me": {
+      "get": {
+        "tags": ["auth"],
+        "summary": "Session status (public, returns unauthenticated when logged out)",
+        "responses": { "200": { "description": "Status", "content": { "application/json": { "schema": { "type": "object", "properties": { "authenticated": { "type": "boolean" }, "username": { "type": "string" }, "project": { "type": "string" } } } } } } }
+      }
+    },
+    "/api/auth/logout": {
+      "post": {
+        "tags": ["auth"],
+        "summary": "Clear session cookie",
+        "responses": { "200": { "description": "Logged out" } }
+      }
+    },
+    "/api/queues": {
+      "get": {
+        "tags": ["queues"],
+        "summary": "All queue metrics",
+        "responses": { "200": { "description": "Metrics per queue", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/QueueMetrics" } } } } } }
+      }
+    },
+    "/api/queues/dependencies": {
+      "get": {
+        "tags": ["queues"],
+        "summary": "Inferred inter-queue dependencies",
+        "responses": { "200": { "description": "Dependency edges" } }
+      }
+    },
+    "/api/queues/{name}": {
+      "get": {
+        "tags": ["queues"],
+        "summary": "Single queue metrics + forecast + history",
+        "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Queue detail" } }
+      }
+    },
+    "/api/queues/{name}/errors": {
+      "get": {
+        "tags": ["queues"],
+        "summary": "Error-group breakdown, most frequent first",
+        "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Error groups", "content": { "application/json": { "schema": { "type": "array", "items": { "type": "object", "properties": { "message": { "type": "string" }, "count": { "type": "integer" } } } } } } } }
+      }
+    },
+    "/api/queues/{name}/analytics": {
+      "get": {
+        "tags": ["queues"],
+        "summary": "Per-queue analytics buckets",
+        "parameters": [
+          { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "range", "in": "query", "schema": { "type": "string", "enum": ["1h", "24h", "7d"], "default": "24h" } }
+        ],
+        "responses": { "200": { "description": "Analytics points" } }
+      }
+    },
+    "/api/queues/{name}/jobs": {
+      "get": {
+        "tags": ["queues"],
+        "summary": "Jobs in a queue (paginated server-side)",
+        "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Job list" } }
+      }
+    },
+    "/api/queues/{name}/actions/pause-retries": {
+      "post": {
+        "tags": ["queues"],
+        "summary": "Pause or resume retries for a queue",
+        "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Updated" } }
+      }
+    },
+    "/api/queues/{name}/actions/retry-failed": {
+      "post": {
+        "tags": ["queues"],
+        "summary": "Retry all failed jobs in a queue",
+        "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Requeued count" } }
+      }
+    },
+    "/api/queues/{name}/actions/clean": {
+      "post": {
+        "tags": ["queues"],
+        "summary": "Clean completed/failed sets for a queue",
+        "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Cleaned counts" } }
+      }
+    },
+    "/api/queues/{name}/jobs/{id}/retry": {
+      "post": {
+        "tags": ["jobs"],
+        "summary": "Retry one failed job",
+        "parameters": [
+          { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "Requeued" } }
+      }
+    },
+    "/api/queues/{name}/jobs/{id}/replay": {
+      "post": {
+        "tags": ["jobs"],
+        "summary": "Replay a job with its original payload",
+        "parameters": [
+          { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "Replayed job id" } }
+      }
+    },
+    "/api/jobs": {
+      "get": {
+        "tags": ["jobs"],
+        "summary": "Jobs across queues (overview table)",
+        "responses": { "200": { "description": "Job list" } }
+      }
+    },
+    "/api/jobs/{id}": {
+      "get": {
+        "tags": ["jobs"],
+        "summary": "Single job with timeline and logs",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Job detail" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/api/workers": {
+      "get": {
+        "tags": ["workers"],
+        "summary": "All worker states",
+        "responses": { "200": { "description": "Worker list" } }
+      }
+    },
+    "/api/workers/heatmap": {
+      "get": {
+        "tags": ["workers"],
+        "summary": "Per-worker hourly CPU/memory/failure heatmap (rolling 24h)",
+        "responses": { "200": { "description": "Heatmap cells" } }
+      }
+    },
+    "/api/incidents": {
+      "get": {
+        "tags": ["incidents"],
+        "summary": "Firing incidents plus history",
+        "responses": { "200": { "description": "{firing, history}" } }
+      }
+    },
+    "/api/alerts/rules": {
+      "get": {
+        "tags": ["alerts"],
+        "summary": "List alert rules",
+        "responses": { "200": { "description": "Rule list" } }
+      },
+      "post": {
+        "tags": ["alerts"],
+        "summary": "Create alert rule",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "properties": { "metric": { "type": "string" }, "threshold": { "type": "number" }, "severity": { "type": "string" }, "webhook": { "type": "string" }, "retentionDays": { "type": "string" } } } } } },
+        "responses": { "200": { "description": "Created" } }
+      }
+    },
+    "/api/alerts/rules/{id}": {
+      "delete": {
+        "tags": ["alerts"],
+        "summary": "Delete alert rule",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Deleted" } }
+      }
+    },
+    "/api/settings": {
+      "get": {
+        "tags": ["analytics"],
+        "summary": "Dashboard settings",
+        "responses": { "200": { "description": "Settings object" } }
+      },
+      "post": {
+        "tags": ["analytics"],
+        "summary": "Update dashboard settings",
+        "responses": { "200": { "description": "Updated" } }
+      }
+    },
+    "/api/analytics": {
+      "get": {
+        "tags": ["analytics"],
+        "summary": "Global analytics aggregates",
+        "parameters": [{ "name": "range", "in": "query", "schema": { "type": "string", "default": "24h" } }],
+        "responses": { "200": { "description": "Aggregates" } }
+      }
+    },
+    "/api/events": {
+      "get": {
+        "tags": ["analytics"],
+        "summary": "Observability event-stream history",
+        "parameters": [
+          { "name": "from", "in": "query", "schema": { "type": "integer" } },
+          { "name": "to", "in": "query", "schema": { "type": "integer" } },
+          { "name": "count", "in": "query", "schema": { "type": "integer", "default": 200 } }
+        ],
+        "responses": { "200": { "description": "Events" } }
+      }
+    },
+    "/api/flows": {
+      "get": {
+        "tags": ["analytics"],
+        "summary": "DAG flow trees",
+        "responses": { "200": { "description": "Flows" } }
+      }
+    },
+    "/api/flows/{id}": {
+      "get": {
+        "tags": ["analytics"],
+        "summary": "Single flow with parent/child resolution",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Flow detail" } }
+      }
+    },
+    "/api/openapi.json": {
+      "get": {
+        "tags": ["analytics"],
+        "summary": "This spec",
+        "responses": { "200": { "description": "OpenAPI document" } }
+      }
+    },
+    "/api/docs": {
+      "get": {
+        "tags": ["analytics"],
+        "summary": "Swagger UI for this spec (HTML)",
+        "responses": { "200": { "description": "Swagger UI page" } }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "QueueMetrics": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "waiting": { "type": "integer" },
+          "active": { "type": "integer" },
+          "delayed": { "type": "integer" },
+          "failed": { "type": "integer" },
+          "completed": { "type": "integer" },
+          "throughput": { "type": "number" },
+          "enqueueRate": { "type": "number" },
+          "completionRate": { "type": "number" },
+          "errorRate": { "type": "number" },
+          "retryRate": { "type": "number" },
+          "avgLatencyMs": { "type": "number" },
+          "p50LatencyMs": { "type": "number" },
+          "p95LatencyMs": { "type": "number" },
+          "p99LatencyMs": { "type": "number" },
+          "netGrowthRate": { "type": "number" },
+          "healthScore": { "type": "number" },
+          "isPaused": { "type": "boolean" }
+        }
+      }
+    }
+  }
+}

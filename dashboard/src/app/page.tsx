@@ -3,13 +3,56 @@ import Topbar from '@/components/layout/Topbar';
 import { relativeTime, healthColor } from '@/lib/utils';
 import { AlertTriangle, CheckCircle2 } from 'lucide-react';
 import Link from 'next/link';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { getQueues, getWorkers, getJobs, getIncidents } from '@/lib/api';
+import { useLiveUpdates } from '@/lib/live';
+
+// Raw API shapes → view shapes (shared by the polling loop and live snapshots)
+function mapQueues(rawQueues: any[]) {
+  return (rawQueues ?? []).map(q => ({
+    name: q.name,
+    health: q.healthScore >= 80 ? 'healthy' : q.healthScore >= 50 ? 'degraded' : 'critical',
+    healthScore: q.healthScore ?? 100,
+    isPaused: q.isPaused ?? false,
+    counts: {
+      waiting: q.waiting ?? 0,
+      active: q.active ?? 0,
+      delayed: q.delayed ?? 0,
+      failed: q.failed ?? 0,
+      completed: q.completed ?? 0,
+      paused: q.paused ?? 0,
+    },
+    throughput: q.throughput ?? 0,
+    avgLatency: q.avgLatencyMs ?? 0,
+    p99Latency: q.p99LatencyMs ?? 0,
+    errorRate: q.errorRate ?? 0,
+    workerCount: q.workerCount ?? 0,
+    retryRate: q.retryRate ?? 0,
+  }));
+}
+
+function mapWorkers(rawWorkers: any[]) {
+  return (rawWorkers ?? []).map(w => ({
+    name: w.id,
+    queue: w.queue,
+    cpu: `${Math.round(w.cpuPercent)}%`,
+    mem: `${Math.round((w.memoryBytes ?? 0) / 1024 / 1024)}MB`,
+    status: w.state === 'online' ? 'working' : w.state === 'idle' ? 'idle' : 'stalled',
+  }));
+}
 
 export default function IntelligencePage() {
   const [queuesData, setQueuesData] = useState<any[]>([]);
   const [workersData, setWorkersData] = useState<any[]>([]);
   const [incidents, setIncidents] = useState<{ firing: any[]; history: any[] }>({ firing: [], history: [] });
+
+  // Live stream (progressive enhancement over the 4s poll below)
+  const applySnapshot = useCallback((snap: { metrics: any[]; incidents: any; workers: any[] }) => {
+    setQueuesData(mapQueues(snap.metrics));
+    setWorkersData(mapWorkers(snap.workers));
+    if (snap.incidents) setIncidents(snap.incidents);
+  }, []);
+  const live = useLiveUpdates(applySnapshot);
 
   useEffect(() => {
     let active = true;
@@ -23,37 +66,12 @@ export default function IntelligencePage() {
         ]);
         if (active) {
           if (rawQueues) {
-            setQueuesData(rawQueues.map(q => ({
-              name: q.name,
-              health: q.healthScore >= 80 ? 'healthy' : q.healthScore >= 50 ? 'degraded' : 'critical',
-              healthScore: q.healthScore ?? 100,
-              isPaused: q.isPaused ?? false,
-              counts: {
-                waiting: q.waiting ?? 0,
-                active: q.active ?? 0,
-                delayed: q.delayed ?? 0,
-                failed: q.failed ?? 0,
-                completed: q.completed ?? 0,
-                paused: q.paused ?? 0,
-              },
-              throughput: q.throughput ?? 0,
-              avgLatency: q.avgLatencyMs ?? 0,
-              p99Latency: q.p99LatencyMs ?? 0,
-              errorRate: q.errorRate ?? 0,
-              workerCount: q.workerCount ?? 0,
-              retryRate: q.retryRate ?? 0,
-            })));
+            setQueuesData(mapQueues(rawQueues));
           } else {
             setQueuesData([]);
           }
           if (rawWorkers) {
-            setWorkersData(rawWorkers.map(w => ({
-              name: w.id,
-              queue: w.queue,
-              cpu: `${Math.round(w.cpuPercent)}%`,
-              mem: `${Math.round((w.memoryBytes ?? 0) / 1024 / 1024)}MB`,
-              status: w.state === 'online' ? 'working' : w.state === 'idle' ? 'idle' : 'stalled',
-            })));
+            setWorkersData(mapWorkers(rawWorkers));
           }
           if (rawIncidents) {
             setIncidents(rawIncidents);
@@ -102,6 +120,17 @@ export default function IntelligencePage() {
               <span style={{ width: 10, height: 10, borderRadius: '50%', background: statusColor }} />
               <span style={{ fontSize: 18, fontWeight: 700, color: 'var(--text-primary)' }}>
                 {overallStatus}
+              </span>
+              <span
+                title={live ? 'Live updates connected' : 'Polling every 4s'}
+                style={{
+                  fontSize: 9, fontWeight: 700, letterSpacing: '0.05em',
+                  color: live ? '#10b981' : 'var(--text-muted)',
+                  border: `1px solid ${live ? '#10b981' : 'var(--border)'}`,
+                  borderRadius: 8, padding: '1px 7px',
+                }}
+              >
+                {live ? '● LIVE' : 'POLL'}
               </span>
             </div>
           </div>

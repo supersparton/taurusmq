@@ -13,8 +13,6 @@
 //   GET  /api/queues/:name/errors               — error group breakdown
 //   GET  /api/workers                           — all worker states
 //   GET  /api/incidents                         — firing + history
-//   GET  /api/incidents/:id/rca                 — RCA hypotheses
-//   GET  /api/recommendations                   — ranked recommendations
 //   GET  /api/events?from=<ms>&to=<ms>          — event stream history
 //   POST /api/queues/:name/actions/pause-retries
 //   WS   /ws                                    — live update stream
@@ -29,7 +27,6 @@ const redis              = require('../../src/utils/redis');
 const { MetricsAggregator }    = require('../metrics-engine/MetricsAggregator');
 const { MetricsCollector }     = require('../metrics-engine/MetricsCollector');
 const { IncidentEngine }       = require('../incident-engine/IncidentEngine');
-const { RecommendationEngine } = require('../recommendation-engine/RecommendationEngine');
 const { ForecastingEngine }    = require('../forecasting-engine/ForecastingEngine');
 const { EventStreamWriter }    = require('../observability-core/EventStreamWriter');
 const { bus }                  = require('../observability-core/ObservabilityBus');
@@ -198,21 +195,6 @@ const server = http.createServer(async (req, res) => {
       const all    = await _incidents.getIncidentHistory(100);
       const firing = await _incidents.getFiringIncidents();
       return json(res, { firing, history: all });
-    }
-
-    // ── GET /api/incidents/:id/rca ────────────────────────────────────────
-    const rcaMatch = path.match(/^\/api\/incidents\/([^/]+)\/rca$/);
-    if (req.method === 'GET' && rcaMatch) {
-      const all      = await _incidents.getIncidentHistory(200);
-      const incident = all.find(i => i.id === rcaMatch[1]);
-      if (!incident) { res.writeHead(404); return res.end(JSON.stringify({ error: 'not found' })); }
-      return json(res, await _recommendations.generateRCA(incident));
-    }
-
-    // ── GET /api/recommendations ──────────────────────────────────────────
-    if (req.method === 'GET' && path === '/api/recommendations') {
-      const firing = await _incidents.getFiringIncidents();
-      return json(res, await _recommendations.generate(firing));
     }
 
     // ── GET /api/alerts/rules ─────────────────────────────────────────────
@@ -991,6 +973,26 @@ const server = http.createServer(async (req, res) => {
       return json(res, { ok: true });
     }
 
+    // ── GET /api/openapi.json ─────────────────────────────────────────────
+    // Machine-readable spec of every route above (spec follows code).
+    if (req.method === 'GET' && path === '/api/openapi.json') {
+      return json(res, require('./openapi.json'));
+    }
+
+    // ── GET /api/docs ─────────────────────────────────────────────────────
+    // Swagger UI (CDN assets). Same-origin via the dashboard /api/* proxy;
+    // JWT cookie auth applies like every other route (browser sends it).
+    if (req.method === 'GET' && path === '/api/docs') {
+      res.setHeader('Content-Type', 'text/html');
+      res.writeHead(200);
+      return res.end(`<!DOCTYPE html><html><head><title>TaurusMQ API Docs</title>` +
+        `<link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">` +
+        `</head><body><div id="swagger-ui"></div>` +
+        `<script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>` +
+        `<script>SwaggerUIBundle({url:'/api/openapi.json',dom_id:'#swagger-ui'});</script>` +
+        `</body></html>`);
+    }
+
     res.writeHead(404);
     res.end(JSON.stringify({ error: 'not found' }));
 
@@ -1043,9 +1045,10 @@ function setupPubSubBridge() {
   const pubClient = new Redis(process.env.REDIS_URL || 'redis://127.0.0.1:6379');
   const subClient = new Redis(process.env.REDIS_URL || 'redis://127.0.0.1:6379');
 
+  // Only bus events that can still fire (alert.*/worker.stalled lost their
+  // emitters with the pull-stack retirement — see types.js removal note).
   const PUSH_EVENTS = new Set([
     'job.completed', 'job.failed', 'worker.heartbeat',
-    'alert.fired', 'alert.resolved', 'worker.stalled',
   ]);
 
   bus.on('*', (event) => {
@@ -1212,7 +1215,6 @@ function json(res, data) {
 
 // ── Engine instances ───────────────────────────────────────────────────────────
 let _incidents;
-let _recommendations;
 let _forecasting;
 let _eventWriter;
 
@@ -1230,7 +1232,6 @@ async function startObservabilityStack(queueNames = [], setup, jwtSecret, port =
   const collector  = new MetricsCollector(bus);
   const aggregator = new MetricsAggregator(queueNames);
   _incidents       = new IncidentEngine(queueNames, bus);
-  _recommendations = new RecommendationEngine();
   _forecasting     = new ForecastingEngine();
   _eventWriter     = new EventStreamWriter();
 

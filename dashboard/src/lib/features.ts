@@ -9,7 +9,7 @@ export const FEATURES = {
   // Phase 2: Debugger (Execution timeline, in-UI logs, stack traces, replay, failure groups) - ENABLED
   PHASE_2_DEBUGGER: true,
 
-  // Phase 3: Incident Center (Playbook recommendations, firing incidents, alerts history) - ENABLED
+  // Phase 3: Incident Center (firing incidents, alerts history) - ENABLED
   PHASE_3_INCIDENT_CENTER: true,
 
   // Phase 4: Analytics (Capacity forecasting, Net growth rates) - ENABLED

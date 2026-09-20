@@ -98,6 +98,7 @@ export interface QueueMetrics {
 
 export const getQueues = ()               => apiFetch<QueueMetrics[]>('/api/queues');
 export const getQueue  = (name: string)   => apiFetch<QueueMetrics & { forecast: any; history?: any[] }>(`/api/queues/${encodeURIComponent(name)}`);
+export const getQueueErrors = (name: string) => apiFetch<{ message: string; count: number }[]>(`/api/queues/${encodeURIComponent(name)}/errors`);
 export const getQueueDependencies = () => apiFetch<any[]>('/api/queues/dependencies');
 
 // ── Workers ────────────────────────────────────────────────────────────────────
@@ -105,10 +106,9 @@ export const getQueueDependencies = () => apiFetch<any[]>('/api/queues/dependenc
 export const getWorkers = () => apiFetch<any[]>('/api/workers');
 export const getWorkerHeatmap = () => apiFetch<any[]>('/api/workers/heatmap');
 
-// ── Incidents + RCA ────────────────────────────────────────────────────────────
+// ── Incidents ──────────────────────────────────────────────────────────────────
 
 export const getIncidents      = ()           => apiFetch<{ firing: any[]; history: any[] }>('/api/incidents');
-export const getRecommendations = ()          => apiFetch<any[]>('/api/recommendations');
 
 // ── Events ─────────────────────────────────────────────────────────────────────
 
