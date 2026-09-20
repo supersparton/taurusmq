@@ -1,8 +1,13 @@
 -- finalizeJob.lua
+-- Finalize one job and, optionally, fetch the next job in the SAME script
+-- (fetch-next piggyback: saves the extra dequeue round trip per job in
+-- steady state — the worker feeds the returned job straight to the pool).
 -- KEYS[1] = jobs hash         e.g. taurusmq:jobs:myqueue
 -- KEYS[2] = active ZSET       e.g. taurusmq:active:myqueue
 -- KEYS[3] = completed ZSET    e.g. taurusmq:completed:myqueue
 -- KEYS[4] = failed ZSET       e.g. taurusmq:failed:myqueue
+-- KEYS[5] = waiting list      e.g. taurusmq:myqueue (fetch-next only)
+-- KEYS[6] = prioritized ZSET  e.g. taurusmq:prioritized:myqueue (fetch-next only)
 -- ARGV[1] = jobId
 -- ARGV[2] = status            ('completed' or 'dead')
 -- ARGV[3] = returnOrFailedVal (string value for returnvalue or failedReason)
@@ -13,6 +18,9 @@
 -- ARGV[8] = prefix            (e.g. 'taurusmq')
 -- ARGV[9] = queueName         (e.g. 'myqueue')
 -- ARGV[10] = publishEvents    ('1' publish, '0' skip; omitted/nil = publish)
+-- ARGV[11] = fetchNext        ('1' = also dequeue next job, else skip)
+-- ARGV[12] = leaseExpiration  (timestamp for the fetched job's active lease)
+-- Returns {1, nextJobJson-or-false}.
 
 local jobId = ARGV[1]
 local status = ARGV[2]
@@ -23,6 +31,10 @@ local removeOnComplete = tonumber(ARGV[6] or 0)
 local removeOnFail = tonumber(ARGV[7] or 0)
 local prefix = ARGV[8]
 local queueName = ARGV[9]
+local publishEvents = (ARGV[10] == nil or ARGV[10] ~= '0')
+local fetchNext = (ARGV[11] == '1')
+local leaseExpiration = tonumber(ARGV[12] or 0)
+local nowMs = tonumber(ARGV[5])
 
 -- 1. Fetch current job JSON from jobs hash
 local jobJson = redis.call('HGET', KEYS[1], jobId)
@@ -113,8 +125,8 @@ end
 -- 4. Publish completed/failed event to channel (skipped for
 -- publishEvents=false workers — QueueEvents subscribers are the only
 -- consumers, and obs feeds off local hooks instead)
-if ARGV[10] == nil or ARGV[10] ~= '0' then
-    local eventsChannel = prefix .. ':' .. queueName .. ':events'
+local eventsChannel = prefix .. ':' .. queueName .. ':events'
+if publishEvents then
     if status == 'completed' then
         local returnvalue = nil
         if returnOrFailedVal and returnOrFailedVal ~= "" then
@@ -133,4 +145,42 @@ if ARGV[10] == nil or ARGV[10] ~= '0' then
     end
 end
 
-return 1
+-- 5. Fetch-next piggyback: dequeue the next job in the same round trip.
+-- Identical semantics to dequeue.lua (prioritized first, first-pickup
+-- attempts rule, lease, active publish). The worker feeds the returned
+-- job straight to the pool; nil/empty queue returns false and the worker
+-- falls back to the blocking BLPOP wait.
+local nextJson = false
+if fetchNext then
+    local nextId = nil
+    local prioritized_ids = redis.call('ZRANGE', KEYS[6], 0, 0)
+    if prioritized_ids and #prioritized_ids > 0 then
+        nextId = prioritized_ids[1]
+        redis.call('ZREM', KEYS[6], nextId)
+    else
+        nextId = redis.call('LPOP', KEYS[5])
+    end
+
+    if nextId then
+        local nextStored = redis.call('HGET', KEYS[1], nextId)
+        if nextStored then
+            local job = cjson.decode(nextStored)
+            -- Only increment attempts on first pickup (same rule as dequeue.lua)
+            local isFirstPickup = not job.processedOn or job.processedOn == cjson.null
+            if isFirstPickup then
+                job.attempts = (job.attempts or 0) + 1
+            end
+            job.status = 'active'
+            job.processedOn = nowMs
+            nextJson = cjson.encode(job)
+            redis.call('HSET', KEYS[1], nextId, nextJson)
+            redis.call('ZADD', KEYS[2], leaseExpiration, nextId)
+            if publishEvents then
+                local activePayload = cjson.encode({ event = 'active', jobId = nextId, prev = 'waiting' })
+                redis.call('PUBLISH', eventsChannel, activePayload)
+            end
+        end
+    end
+end
+
+return {1, nextJson}

@@ -121,7 +121,7 @@ function defineCommands(client) {
     }
     if (!client.finalizeJob) {
         client.defineCommand('finalizeJob', {
-            numberOfKeys: 4,
+            numberOfKeys: 6,
             lua: fs.readFileSync(path.join(__dirname, '../lua/finalizeJob.lua'), 'utf-8')
         });
     }

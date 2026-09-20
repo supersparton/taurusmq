@@ -137,6 +137,7 @@ class Worker extends EventEmitter {
 
             try {
                 const blpopResult = await this._fetcherClient.blpop(this.rediskeysignal, 60);
+                if (!this.active) break;
                 if (!blpopResult) continue;
                 if (blpopResult[1] === '__shutdown__') continue;
                 if (this.paused) {
@@ -162,6 +163,57 @@ class Worker extends EventEmitter {
                     }
                 }
 
+                // Drain-then-block: one BLPOP wakeup feeds a burst of dequeues
+                // instead of exactly one job (the old 1-token-1-job loop capped
+                // throughput at ~1 job per 2 RTTs no matter the concurrency).
+                await this._drainBurst();
+            } catch (err) {
+                if (!this.active) break;
+                // BLPOP throws on disconnect during stop — exit cleanly
+                if (err.message && err.message.includes('Connection is closed')) break;
+                this.logger.error("Worker fetcher error:", err);
+                if (this.active) this.emit('error', err);
+                await sleep(100);
+            }
+        }
+    }
+
+    // Drain available jobs without returning to BLPOP between each one.
+    // Returns to the blocking wait only when a dequeue comes back empty
+    // (plus a stale-token cleanup + racer recatch, see below).
+    async _drainBurst() {
+        // Limiter set → legacy single dequeue per wakeup. Bursting would
+        // admit up to C jobs per single rate check and silently multiply
+        // the configured max. Limiter users keep exact current semantics.
+        const singleShot = !!this.limiter;
+        for (;;) {
+            if (!this.active || this.paused) return;
+            if (this._poolRunning >= this.concurrency) return;
+            const n = await this._dequeueOnce();
+            if (n > 0) {
+                if (singleShot) return;
+                continue;
+            }
+            // Dequeue came back empty: the burst is over. Producers push one
+            // signal token per add but a burst consumes many jobs per wake, so
+            // the signal list holds a stale surplus — thousands of tokens would
+            // each cause a wasted wake+empty-dequeue cycle. Clear it, then
+            // recatch: a job added between the empty dequeue and the DEL is
+            // caught here; a job added after carries its own token into BLPOP.
+            // Either way no job can strand tokenless.
+            try {
+                await this.redisClient.del(this.rediskeysignal);
+            } catch (_) {}
+            if (!this.active || this.paused) return;
+            if (this._poolRunning >= this.concurrency) return;
+            const m = await this._dequeueOnce();
+            if (m === 0) return;
+            if (singleShot) return;
+        }
+    }
+
+    // One dequeue round (batch or single path). Returns jobs fed to the pool.
+    async _dequeueOnce() {
                 if (this.batchsize > 1) {
                     const batchResult = await this.redisClient.batchdequeue(
                         this.rediskey,
@@ -207,7 +259,9 @@ class Worker extends EventEmitter {
                             await pipe.exec();
                         }
                         this._runInPool(() => this._executeBatch(jobs));
+                        return jobs.length;
                     }
+                    return 0;
                 } else {
                     const jobjson = await this.redisClient.dequeue(
                         this.rediskey,
@@ -223,17 +277,10 @@ class Worker extends EventEmitter {
                     if (jobjson) {
                         const job = JSON.parse(jobjson);
                         this._runInPool(() => this._executeJob(job));
+                        return 1;
                     }
+                    return 0;
                 }
-            } catch (err) {
-                if (!this.active) break;
-                // BLPOP throws on disconnect during stop — exit cleanly
-                if (err.message && err.message.includes('Connection is closed')) break;
-                this.logger.error("Worker fetcher error:", err);
-                if (this.active) this.emit('error', err);
-                await sleep(100);
-            }
-        }
     }
 
     async _executeBatch(jobs) {
@@ -310,9 +357,18 @@ class Worker extends EventEmitter {
             job.status = "completed";
             await this.scheduleNextRun(job);
             if (this.options.debug) this.logger.debug(`[Worker Debug] calling finalizejob for job ${job.id}`);
-            await this.finalizejob(job);
+            // NOTE: finalize directly — buffering completions behind a batch
+            // barrier was measured -20% throughput (slots idle waiting for
+            // peers; ioredis already multiplexes concurrent slots, so batching
+            // saves no round trips against single-threaded Redis).
+            // Fetch-next piggyback: the same script also dequeues the next job,
+            // collapsing finish+fetch into one round trip (nil → BLPOP path).
+            const nextJob = await this.finalizeAndFetch(job);
             if (this.options.debug) this.logger.debug(`[Worker Debug] finalizejob finished for job ${job.id}`);
             this.emit('completed', { jobId: job.id, returnvalue: job.returnvalue });
+            if (nextJob) {
+                this._runInPool(() => this._executeJob(nextJob));
+            }
         } catch (err) {
             handlerError = err;
         } finally {
@@ -451,6 +507,8 @@ class Worker extends EventEmitter {
                 `${this.prefix}:active:${this.queuename}`,
                 `${this.prefix}:completed:${this.queuename}`,
                 `${this.prefix}:failed:${this.queuename}`,
+                this.rediskey,
+                this.rediskeyprioritized,
                 job.id,
                 job.status === 'completed' ? 'completed' : 'dead',
                 job.status === 'completed' ? (job.returnvalue !== undefined ? JSON.stringify(job.returnvalue) : "") : (job.failedReason || ""),
@@ -461,49 +519,97 @@ class Worker extends EventEmitter {
                 this.prefix,
                 this.queuename,
                 // Omitted by older callers → nil → lua defaults to publishing
-                this.publishEvents === false ? '0' : '1'
+                this.publishEvents === false ? '0' : '1',
+                // Plain finalize: never fetch-next (failure/batch paths and
+                // direct callers keep exact legacy behavior).
+                '0',
+                Date.now() + this.lockDuration
             );
 
-            if (job.status === 'dead') {
-                await this.redisClient.hset(this.rediskeydlq, job.id, JSON.stringify(job));
-            }
-
-            // DAG participants: fan-in children (false), legacy flag (true),
-            // fan-out parents/children ('fan-out'). Completion must release
-            // jobs blocked on this job via unblock().
-            if (job.flow === true || job.flow === false || job.flow === 'fan-out') {
-                if (job.status === 'completed') {
-                    await this.redisClient.unblock(job.id, "parent", "children", this.prefix);
-                } else {
-                    const parents = job.parent || [];
-                    for (const parentId of parents) {
-                        const parentJson = await this.redisClient.hget(`${this.prefix}:jobs:${this.queuename}`, parentId);
-                        if (parentJson) {
-                            const parentJob = JSON.parse(parentJson);
-                            parentJob.status = 'dead';
-                            parentJob.failedReason = `child ${job.id} failed: ${job.failedReason || 'unknown error'}`;
-                            await this.redisClient.hset(`${this.prefix}:jobs:${this.queuename}`, parentId, JSON.stringify(parentJob));
-                            await this.redisClient.hset(this.rediskeydlq, parentId, JSON.stringify(parentJob));
-                            await this.redisClient.hdel(`${this.prefix}:blocked:${this.queuename}`, parentId);
-                            await this.redisClient.del(`${this.prefix}:job:${parentId}:count`);
-                            await this.redisClient.del(`${this.prefix}:job:${parentId}:name`);
-                            await this.redisClient.zadd(`${this.prefix}:failed:${this.queuename}`, Date.now(), parentId);
-                            await this._publishEvent({
-                                event: 'failed', jobId: parentId, failedReason: parentJob.failedReason
-                            });
-                        }
-                    }
-                }
-            }
-            if (job.batchid) {
-                const remaining = await this.redisClient.decr(`${this.prefix}:batch:${job.batchid}:count`);
-                if (parseInt(remaining) === 0) {
-                    await this.redisClient.del(`${this.prefix}:batch:${job.batchid}:count`);
-                }
-            }
+            await this._postFinalize(job);
         } catch (err) {
             this.emit('error', err);
         }
+    }
+
+    // JS-side work after the finalizeJob lua script: DLQ write for dead jobs,
+    // DAG unblock / dead-parent cascade, batch counting. Shared by finalizejob
+    // and finalizeAndFetch so the piggyback path cannot skip DAG releases.
+    async _postFinalize(job) {
+        if (job.status === 'dead') {
+            await this.redisClient.hset(this.rediskeydlq, job.id, JSON.stringify(job));
+        }
+
+        // DAG participants: fan-in children (false), legacy flag (true),
+        // fan-out parents/children ('fan-out'). Completion must release
+        // jobs blocked on this job via unblock().
+        if (job.flow === true || job.flow === false || job.flow === 'fan-out') {
+            if (job.status === 'completed') {
+                await this.redisClient.unblock(job.id, "parent", "children", this.prefix);
+            } else {
+                const parents = job.parent || [];
+                for (const parentId of parents) {
+                    const parentJson = await this.redisClient.hget(`${this.prefix}:jobs:${this.queuename}`, parentId);
+                    if (parentJson) {
+                        const parentJob = JSON.parse(parentJson);
+                        parentJob.status = 'dead';
+                        parentJob.failedReason = `child ${job.id} failed: ${job.failedReason || 'unknown error'}`;
+                        await this.redisClient.hset(`${this.prefix}:jobs:${this.queuename}`, parentId, JSON.stringify(parentJob));
+                        await this.redisClient.hset(this.rediskeydlq, parentId, JSON.stringify(parentJob));
+                        await this.redisClient.hdel(`${this.prefix}:blocked:${this.queuename}`, parentId);
+                        await this.redisClient.del(`${this.prefix}:job:${parentId}:count`);
+                        await this.redisClient.del(`${this.prefix}:job:${parentId}:name`);
+                        await this.redisClient.zadd(`${this.prefix}:failed:${this.queuename}`, Date.now(), parentId);
+                        await this._publishEvent({
+                            event: 'failed', jobId: parentId, failedReason: parentJob.failedReason
+                        });
+                    }
+                }
+            }
+        }
+        if (job.batchid) {
+            const remaining = await this.redisClient.decr(`${this.prefix}:batch:${job.batchid}:count`);
+            if (parseInt(remaining) === 0) {
+                await this.redisClient.del(`${this.prefix}:batch:${job.batchid}:count`);
+            }
+        }
+    }
+
+    // Finalize a successfully completed job AND dequeue the next job in the
+    // same round trip (fetch-next piggyback). Returns the parsed next job,
+    // or null when the queue is momentarily empty (caller falls back to the
+    // blocking BLPOP wait). Piggyback runs only when it is provably safe —
+    // paused workers, rate-limited workers, and shutdown keep the plain
+    // finalizejob() path with byte-identical legacy behavior.
+    async finalizeAndFetch(job) {
+        const canPiggyback = this.active && !this.paused && !this.limiter;
+        const res = await this.redisClient.finalizeJob(
+            `${this.prefix}:jobs:${this.queuename}`,
+            `${this.prefix}:active:${this.queuename}`,
+            `${this.prefix}:completed:${this.queuename}`,
+            `${this.prefix}:failed:${this.queuename}`,
+            this.rediskey,
+            this.rediskeyprioritized,
+            job.id,
+            'completed',
+            job.returnvalue !== undefined ? JSON.stringify(job.returnvalue) : "",
+            job.progress !== undefined ? String(job.progress) : "",
+            Date.now(),
+            this.options.removeOnComplete !== undefined ? this.options.removeOnComplete : 1000,
+            this.options.removeOnFail !== undefined ? this.options.removeOnFail : 1000,
+            this.prefix,
+            this.queuename,
+            this.publishEvents === false ? '0' : '1',
+            canPiggyback ? '1' : '0',
+            Date.now() + this.lockDuration
+        );
+        // Shared JS-side post-finalize (DLQ/DAG-unblock/batch counting) —
+        // identical to the finalizejob() path, so piggybacked completions
+        // release DAG dependents exactly like traditionally finalized ones.
+        await this._postFinalize(job);
+        const nextJson = Array.isArray(res) ? res[1] : null;
+        if (!nextJson) return null;
+        return JSON.parse(nextJson);
     }
 
     async handleFailure(job, err) {

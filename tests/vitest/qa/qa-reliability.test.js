@@ -112,7 +112,7 @@ describe('QA reliability', () => {
       // Finalize a new job with removeOnComplete=2 → should evict oldest non-DAG
       const r = await queue.add('new', {});
       const newId = typeof r === 'string' ? r : r.id;
-      await client.finalizeJob(`${prefix}:jobs:q`, `${prefix}:active:q`, `${prefix}:completed:q`, `${prefix}:failed:q`, newId, 'completed', 'ok', '', Date.now(), 2, 2, prefix, 'q');
+      await client.finalizeJob(`${prefix}:jobs:q`, `${prefix}:active:q`, `${prefix}:completed:q`, `${prefix}:failed:q`, `${prefix}:q`, `${prefix}:prioritized:q`, newId, 'completed', 'ok', '', Date.now(), 2, 2, prefix, 'q', '1', '0', Date.now() + 30000);
       // DAG job should survive
       expect(await client.hexists(`${prefix}:jobs:q`, middleId)).toBe(1);
       expect(await client.zscore(`${prefix}:completed:q`, middleId)).not.toBeNull();

@@ -48,7 +48,7 @@ class Queue {
             const result = await this.client.addJob(
                 this.rediskeyjobs, this.rediskey, this.rediskeysignal, this.rediskeyprioritized,
                 j.id, j.toJson(), j.priority || 0, j.timestamp,
-                'parent', this.prefix, this.queuename, j.parent.length
+                'parent', this.prefix, this.queuename
             );
 
             if (result === 0) {
@@ -56,10 +56,20 @@ class Queue {
                 return { id: j.id, deduplicated: true };
             }
 
+            if (result === 2) {
+                // Lua auto-promoted: every parent had already finished, so the
+                // child went straight to waiting (signal pushed in-script).
+                // Skip promoteIfUnblocked — there is nothing left to promote.
+                await this.client.publish(`${this.prefix}:${this.queuename}:events`, JSON.stringify({ event: 'waiting', jobId: j.id }));
+                return { id: j.id, deduplicated: false };
+            }
+
             // ── DAG race-condition fix (atomic Lua) ────────────────────────────
-            // A parent may have already finished before we registered this child.
+            // A parent may finish in the window between addJob and this check.
             // promoteIfUnblocked.lua atomically checks the counter and promotes
             // if all parents already completed — no JS+Redis race window.
+            // (Parents finished well before registration are handled inside
+            // addJob itself, which returns 2 above.)
             await this.client.promoteIfUnblocked(
                 this.rediskeyblocked, this.rediskeyprioritized,
                 this.rediskey, this.rediskeysignal,
@@ -175,19 +185,32 @@ class Queue {
             ...luaArgs
         );
 
-        // Signal jobs that were actually created (result == 1)
+        // Signal jobs that were actually created (result == 1).
+        // One multi-value LPUSH per list: each token wakes one fetcher
+        // dequeue and order is irrelevant, so N sequential round-trips
+        // collapse into two. (A per-item await loop here cost ~2s per
+        // 1000-item batch on typical RTT.)
+        const signalById = new Map(signalJobs.map(s => [s.id, s]));
         let createdCount = 0;
+        let waitingTokens = 0;
+        const delayedTimes = [];
         for (let i = 0; i < results.length; i++) {
             if (results[i] === 1) {
                 createdCount++;
-                const signalInfo = signalJobs.find(s => s.id === luaArgs[i * 5]);
+                const signalInfo = signalById.get(luaArgs[i * 5]);
                 if (signalInfo) {
-                    await this.client.lpush(this.rediskeysignaldelayed, signalInfo.executetime);
+                    delayedTimes.push(signalInfo.executetime);
                 } else {
                     // Waiting / prioritized: wake worker via signal list
-                    await this.client.lpush(this.rediskeysignal, 1);
+                    waitingTokens++;
                 }
             }
+        }
+        if (waitingTokens > 0) {
+            await this.client.lpush(this.rediskeysignal, ...new Array(waitingTokens).fill(1));
+        }
+        if (delayedTimes.length > 0) {
+            await this.client.lpush(this.rediskeysignaldelayed, ...delayedTimes);
         }
 
         // If nothing was created (all duplicates), remove batch counter

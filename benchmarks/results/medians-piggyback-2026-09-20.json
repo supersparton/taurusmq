@@ -1,0 +1,30 @@
+{
+  "ts": "2026-09-20T04:08:59.520Z",
+  "node": "v22.16.0",
+  "note": "post finalize-and-fetch-next piggyback",
+  "rttMs": {
+    "taurus": [
+      19,
+      21,
+      20
+    ],
+    "bullmq": [
+      50,
+      48,
+      34
+    ]
+  },
+  "taurusmq": {
+    "phaseA_reqPerSec": 2396,
+    "phaseA2_addsPerSec": 17301,
+    "drain_default_C10": 1938,
+    "drain_tuned_C10": 1961,
+    "drain_default_C50": 3906,
+    "drain_tuned_C50": 3861
+  },
+  "bullmq": {
+    "phaseA2_addsPerSec": 10066,
+    "drain_C10": 1288,
+    "drain_C50": 1783
+  }
+}

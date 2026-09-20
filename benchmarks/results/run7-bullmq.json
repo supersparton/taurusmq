@@ -1,0 +1,26 @@
+{
+  "lib": "bullmq",
+  "node": "v22.16.0",
+  "redis": "redis://localhost:6379",
+  "ts": "2026-09-19T17:45:30.114Z",
+  "rttMs": 33,
+  "phaseA2": {
+    "jobs": 50000,
+    "batch": 1000,
+    "addsPerSec": 15504
+  },
+  "phaseB": [
+    {
+      "concurrency": 10,
+      "jobsPerSec": 3922,
+      "handlerOk": true,
+      "connFootprint": 3
+    },
+    {
+      "concurrency": 50,
+      "jobsPerSec": 3861,
+      "handlerOk": true,
+      "connFootprint": 3
+    }
+  ]
+}

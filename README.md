@@ -94,18 +94,30 @@ To evaluate performance, TaurusMQ was benchmarked side-by-side against BullMQ (v
 
 ## Current Benchmarks (re-measured in Phase B)
 
-Methodology: `../bench/enqueue-consumer.js` (two rounds: default and
-`publishEvents:false`) plus `../bench/bullmq-baseline.js` parity protocol —
-2,000 jobs at concurrency 10, trivial handler, keep-all retention both sides.
+Methodology (Sept 2026 engine with finalize-and-fetch-next, localhost Redis,
+Node 22, 3 runs back-to-back, median reported):
+`../bench/enqueue-consumer.js` plus `../bench/bullmq-baseline.js` parity
+protocol — trivial handler, keep-all retention both sides. Raw JSON per run:
+`benchmarks/results/run{10,11,12}-*.json`; medians:
+`benchmarks/results/medians-piggyback-2026-09-20.json`.
 
 | Phase | TaurusMQ (median of 3) | BullMQ 6.x (median of 3) |
 |---|---|---|
-| Enqueue, direct adds | TBD | TBD |
-| Enqueue, HTTP pipelined | TBD | n/a |
-| Drain, jobs/sec | TBD | TBD |
-| Worker connections | 3 (exact) | TBD (measured footprint) |
+| Bulk enqueue, addBulk×1000 | **17,301/s** (16.5K–17.3K) | 10,066/s (9.4K–11K) |
+| Enqueue, HTTP pipelined | 2,396 req/s, 0 errors | n/a (no HTTP layer) |
+| Drain C=10, jobs/sec | 1,938 (default) / 1,961 (tuned) | 1,288 |
+| Drain C=50, jobs/sec | 3,906 (default) / 3,861 (tuned) | 1,783 |
+| Worker connections | 3 (exact, any C) | +3 footprint |
+| Correctness | handler == completed, 0 failed | handler == completed |
 
-*Table filled by Phase B runs. Do not quote single-run numbers.*
+Reading notes: TaurusMQ now leads every cell — bulk ~1.7×, drain ~1.5× @
+C=10 and ~2.2× @ C=50. The turnaround came from two measured fixes:
+drain-then-block (BLPOP waits 301→2 per 300 jobs, proven by MONITOR trace)
+and finalize-and-fetch-next (finish+fetch in one Lua script, down from 2
+sequential round-trips per job — the same piggyback pattern BullMQ itself
+uses). Attempt/lease/event semantics unchanged; QueueEvents still sees
+exactly one active + one completed per job. Absolute numbers move with Redis
+RTT; the *ratios* are the stable signal. Single-run figures are not quotable.
 
 ---
 

@@ -1,0 +1,19 @@
+{
+  "run": "endurance soak, current engine",
+  "ts": "2026-09-19",
+  "command": "node benchmarks/endurance.js --duration=1800 --concurrency=50",
+  "redis": "redis://127.0.0.1:6379 (local)",
+  "jobs": 560000,
+  "duration": "0h 31m 22s",
+  "avgThroughputJobsSec": 297.57,
+  "peakThroughputJobsSec": 399.77,
+  "completed": 560000,
+  "failed": 0,
+  "waiting": 0,
+  "active": 0,
+  "memoryStartMB": 51,
+  "memoryEndMB": 92,
+  "status": "PASS",
+  "reconciliation": "560000 completed + 0 failed + 0 waiting + 0 active = 560000 enqueued. Zero unaccounted jobs.",
+  "fullLog": "taurusmq-archive/soak-2026-09-19.log"
+}

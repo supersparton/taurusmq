@@ -1,0 +1,45 @@
+{
+  "lib": "taurusmq",
+  "node": "v22.16.0",
+  "redis": "redis://localhost:6379",
+  "ts": "2026-09-19T12:48:36.195Z",
+  "rttMs": 20,
+  "phaseA": {
+    "reqPerSec": 1551,
+    "p50Ms": 755,
+    "p99Ms": 1059,
+    "errors": 0,
+    "timeouts": 0
+  },
+  "phaseA2": {
+    "jobs": 50000,
+    "batch": 1000,
+    "addsPerSec": 17556
+  },
+  "phaseB": [
+    {
+      "label": "default C=10",
+      "concurrency": 10,
+      "jobsPerSec": 234,
+      "poolProof": true
+    },
+    {
+      "label": "tuned C=10",
+      "concurrency": 10,
+      "jobsPerSec": 233,
+      "poolProof": true
+    },
+    {
+      "label": "default C=50",
+      "concurrency": 50,
+      "jobsPerSec": 221,
+      "poolProof": true
+    },
+    {
+      "label": "tuned C=50",
+      "concurrency": 50,
+      "jobsPerSec": 441,
+      "poolProof": true
+    }
+  ]
+}

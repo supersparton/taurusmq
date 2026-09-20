@@ -1,0 +1,29 @@
+{
+  "ts": "2026-09-19T12:53:10.559Z",
+  "node": "v22.16.0",
+  "rttMs": {
+    "taurus": [
+      27,
+      20,
+      13
+    ],
+    "bullmq": [
+      119,
+      49,
+      44
+    ]
+  },
+  "taurusmq": {
+    "phaseA_reqPerSec": 2107,
+    "phaseA2_addsPerSec": 17556,
+    "drain_default_C10": 234,
+    "drain_tuned_C10": 233,
+    "drain_default_C50": 221,
+    "drain_tuned_C50": 441
+  },
+  "bullmq": {
+    "phaseA2_addsPerSec": 15133,
+    "drain_C10": 1974,
+    "drain_C50": 3891
+  }
+}
